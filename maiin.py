@@ -1,313 +1,1639 @@
 import flet as ft
-import json
+import sqlite3
+import hashlib
+import csv
 import os
+import shutil
 from datetime import datetime
 
-DATA_FILE = "stationery_data.json"
-
-class StationeryItem:
-    def __init__(self, name: str, quantity: int = 1, price: float = 0.0):
-        self.name = name.strip()
-        self.quantity = quantity
-        self.price = price
-
-    def to_dict(self): 
-        return {"name": self.name, "quantity": self.quantity, "price": self.price}
-
-    @staticmethod
-    def from_dict(data):
-        return StationeryItem(data["name"], data["quantity"], data["price"])
+DB_FILE = "stationery.db"
+BACKUP_DIR = "backups"
 
 
-class ItemCard(ft.Container):
-    def __init__(self, item: StationeryItem, on_update, on_delete, parent_page: ft.Page):
-        super().__init__()
-        self.item = item
-        self.on_update = on_update
-        self.on_delete = on_delete
-        self._parent_page = parent_page
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
 
-        self.name_text = ft.Text(item.name, size=16, weight=ft.FontWeight.W_500, expand=True)
-        self.qty_text = ft.Text(str(item.quantity), size=14)
-        self.price_text = ft.Text(f"${item.price:.2f}", size=14, color=ft.Colors.GREEN_700)
-        self.total_text = ft.Text(f"${item.quantity * item.price:.2f}", size=14, weight=ft.FontWeight.BOLD)
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL,
+        full_name TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
 
-        self.qty_minus = ft.IconButton(icon=ft.Icons.REMOVE, icon_size=18, on_click=self.decrement_qty)
-        self.qty_plus = ft.IconButton(icon=ft.Icons.ADD, icon_size=18, on_click=self.increment_qty)
-        self.edit_btn = ft.IconButton(icon=ft.Icons.EDIT, icon_color=ft.Colors.BLUE_600, on_click=self.edit_item)
-        self.delete_btn = ft.IconButton(icon=ft.Icons.DELETE_OUTLINE, icon_color=ft.Colors.RED_400, on_click=self.delete_item)
+    c.execute('''CREATE TABLE IF NOT EXISTS suppliers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        contact_person TEXT,
+        phone TEXT,
+        email TEXT,
+        address TEXT
+    )''')
 
-        self.content = ft.Column(
-            controls=[
-                ft.Row(
-                    controls=[self.name_text, ft.Row(controls=[self.edit_btn, self.delete_btn], spacing=0)],
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                ),
-                ft.Row(
+    c.execute('''CREATE TABLE IF NOT EXISTS items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        category TEXT,
+        barcode TEXT UNIQUE,
+        quantity INTEGER DEFAULT 0,
+        price REAL DEFAULT 0.0,
+        cost_price REAL DEFAULT 0.0,
+        low_stock_threshold INTEGER DEFAULT 5,
+        supplier_id INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS customers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        phone TEXT,
+        email TEXT,
+        loyalty_points INTEGER DEFAULT 0,
+        total_spent REAL DEFAULT 0.0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS sales (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        customer_id INTEGER,
+        subtotal REAL,
+        discount REAL DEFAULT 0,
+        tax REAL DEFAULT 0,
+        total REAL,
+        payment_method TEXT,
+        user_id INTEGER,
+        FOREIGN KEY (customer_id) REFERENCES customers(id),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS sale_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sale_id INTEGER,
+        item_id INTEGER,
+        quantity INTEGER,
+        price_at_sale REAL,
+        total REAL,
+        FOREIGN KEY (sale_id) REFERENCES sales(id),
+        FOREIGN KEY (item_id) REFERENCES items(id)
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        action TEXT,
+        details TEXT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )''')
+
+    admin_pwd = hashlib.sha256("admin123".encode()).hexdigest()
+    c.execute(
+        "INSERT OR IGNORE INTO users (username, password_hash, role, full_name) VALUES (?,?,?,?)",
+        ("admin", admin_pwd, "admin", "Administrator"),
+    )
+    for k, v in [
+        ("categories", "Pens,Notebooks,Art Supplies,Office Equipment,Other"),
+        ("store_name",  "Uptown Stationery"),
+        ("tax_rate",    "0"),
+        ("dark_mode",   "false"),
+        ("currency",    "USD"),
+    ]:
+        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?,?)", (k, v))
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+def hash_password(pwd: str) -> str:
+    return hashlib.sha256(pwd.encode()).hexdigest()
+
+
+def verify_password(pwd: str, hash_val: str) -> bool:
+    return hash_password(pwd) == hash_val
+
+
+def log_audit(user_id: int, action: str, details: str = ""):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO audit_log (user_id, action, details) VALUES (?,?,?)",
+              (user_id, action, details))
+    conn.commit()
+    conn.close()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key=?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
+    conn.commit()
+    conn.close()
+
+
+def currency_symbol() -> str:
+    return {"USD": "$", "EUR": "€", "GBP": "£", "TZS": "TSh", "KES": "KSh"}.get(
+        get_setting("currency", "USD"), "$"
+    )
+
+
+class LoginPage(ft.Container):
+    def __init__(self, on_login_success):
+        super().__init__(expand=True)
+        self.on_login_success = on_login_success
+
+        self.username_field = ft.TextField(
+            label="Username", width=320, height=55,
+            border_radius=10, prefix_icon=ft.Icons.PERSON,
+            on_submit=self.do_login,
+        )
+        self.password_field = ft.TextField(
+            label="Password", password=True, can_reveal_password=True,
+            width=320, height=55, border_radius=10,
+            prefix_icon=ft.Icons.LOCK, on_submit=self.do_login,
+        )
+        self.error_text = ft.Text("", color=ft.Colors.RED_400, size=13)
+
+        store_name = get_setting("store_name", "Uptown Stationery")
+
+        # Use ft.Alignment(0, 0) — compatible with all Flet versions.
+        # Do NOT use ft.alignment.center (causes AttributeError on some versions).
+        self.content = ft.Container(
+            content=ft.Container(
+                content=ft.Column(
                     controls=[
-                        ft.Text("Qty:", size=12, color=ft.Colors.GREY_600),
-                        self.qty_minus, self.qty_text, self.qty_plus,
-                        ft.VerticalDivider(width=1),
-                        ft.Text("Price:", size=12, color=ft.Colors.GREY_600), self.price_text,
-                        ft.VerticalDivider(width=1),
-                        ft.Text("Total:", size=12, color=ft.Colors.GREY_600), self.total_text,
+                        ft.Icon(ft.Icons.STORE_MALL_DIRECTORY, size=80, color=ft.Colors.BLUE_700),
+                        ft.Text(store_name, size=28, weight=ft.FontWeight.BOLD),
+                        ft.Text("Management System", size=16, color=ft.Colors.GREY_600),
+                        ft.Container(height=10),
+                        self.username_field,
+                        self.password_field,
+                        self.error_text,
+                        ft.ElevatedButton(
+                            "Login", width=320, height=50,
+                            style=ft.ButtonStyle(
+                                shape=ft.RoundedRectangleBorder(radius=10),
+                                bgcolor=ft.Colors.BLUE_700,
+                                color=ft.Colors.WHITE,
+                            ),
+                            on_click=self.do_login,
+                        ),
                     ],
-                    spacing=8,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=14,
+                    alignment=ft.MainAxisAlignment.CENTER,
                 ),
-            ],
-            spacing=8,
+                padding=40,
+                border_radius=16,
+                bgcolor=ft.Colors.WHITE,
+                shadow=ft.BoxShadow(
+                    blur_radius=20,
+                    color=ft.Colors.BLACK12,
+                    offset=ft.Offset(0, 4),
+                ),
+                width=420,
+            ),
+            expand=True,
+            alignment=ft.Alignment(0, 0),   # ← FIXED (was ft.alignment.center)
         )
 
-        super().__init__(
-            content=self.content,
-            bgcolor=ft.Colors.WHITE,
-            padding=12,
-            border_radius=10,
-            shadow=ft.BoxShadow(spread_radius=1, blur_radius=4, color=ft.Colors.BLACK12),
-            margin=ft.margin.only(bottom=8),
-        )
+    def do_login(self, e):
+        user = (self.username_field.value or "").strip()
+        pwd  = (self.password_field.value or "").strip()
 
-    def refresh_display(self):
-        self.qty_text.value = str(self.item.quantity)
-        self.price_text.value = f"${self.item.price:.2f}"
-        self.total_text.value = f"${self.item.quantity * self.item.price:.2f}"
-        self.update()
+        if not user or not pwd:
+            self.error_text.value = "Please enter username and password"
+            self.update()
+            return
 
-    def increment_qty(self, e):
-        self.item.quantity += 1
-        self.refresh_display()
-        self.on_update()
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, password_hash, role FROM users WHERE username=?", (user,))
+        row = c.fetchone()
+        conn.close()
 
-    def decrement_qty(self, e):
-        if self.item.quantity > 1:
-            self.item.quantity -= 1
-            self.refresh_display()
-            self.on_update()
+        if row and verify_password(pwd, row[1]):
+            log_audit(row[0], "LOGIN", f"User {user} logged in")
+            self.on_login_success(row[0], user, row[2])
         else:
-            self.delete_item(e)
-
-    def edit_item(self, e):
-        name_field = ft.TextField(label="Item Name", value=self.item.name)
-        price_field = ft.TextField(label="Price ($)", value=str(self.item.price), keyboard_type=ft.KeyboardType.NUMBER)
-
-        def save_changes(e):
-            new_name = name_field.value.strip()
-            if new_name:
-                self.item.name = new_name
-                self.name_text.value = new_name
-            try:
-                new_price = float(price_field.value)
-                if new_price >= 0:
-                    self.item.price = new_price
-            except ValueError:
-                pass
-            self.refresh_display()
-            self.on_update()
-            dialog.open = False
-            self._parent_page.update()
-
-        dialog = ft.AlertDialog(
-            title=ft.Text("Edit Item"),
-            content=ft.Column([name_field, price_field], tight=True, spacing=10),
-            actions=[ft.TextButton("Cancel", on_click=lambda e: setattr(dialog, 'open', False)),
-                     ft.ElevatedButton("Save", on_click=save_changes)],
-            actions_alignment=ft.MainAxisAlignment.END,
-        )
-        self._parent_page.dialog = dialog
-        dialog.open = True
-        self._parent_page.update()
-
-    def delete_item(self, e):
-        def confirm_delete(e):
-            self.on_delete(self)
-            dialog.open = False
-            self._parent_page.update()
-
-        dialog = ft.AlertDialog(
-            title=ft.Text("Delete Item"),
-            content=ft.Text(f"Are you sure you want to delete '{self.item.name}'?"),
-            actions=[ft.TextButton("Cancel", on_click=lambda e: setattr(dialog, 'open', False)),
-                     ft.ElevatedButton("Delete", on_click=confirm_delete, bgcolor=ft.Colors.RED_400)],
-            actions_alignment=ft.MainAxisAlignment.END,
-        )
-        self._parent_page.dialog = dialog
-        dialog.open = True
-        self._parent_page.update()
+            self.error_text.value = "Invalid username or password"
+            self.update()
 
 
 class StationeryApp(ft.Container):
-    def __init__(self, page: ft.Page):
-        super().__init__()
-        self._parent_page = page
-        self.items = []
-        self.cards = []
-        self._initialized = False  # flag to prevent update before mount
-
-        self.name_input = ft.TextField(hint_text="Item name", expand=True, border_radius=30, filled=True, on_submit=self.add_item)
-        self.price_input = ft.TextField(hint_text="Price ($)", width=120, border_radius=30, filled=True, keyboard_type=ft.KeyboardType.NUMBER)
-        self.add_button = ft.ElevatedButton("Add Item", icon=ft.Icons.ADD, bgcolor=ft.Colors.BLUE_600, color=ft.Colors.WHITE, on_click=self.add_item)
-        self.search_field = ft.TextField(hint_text="Search", expand=True, border_radius=30, filled=True, on_change=self.filter_items)
-        self.clear_search_btn = ft.IconButton(icon=ft.Icons.CLOSE, on_click=self.clear_search)
-        self.stats_text = ft.Text("Total items: 0 | Total value: $0.00", size=14, color=ft.Colors.GREY_700)
-        self.items_column = ft.Column(spacing=5, scroll=ft.ScrollMode.AUTO, expand=True)
-        self.clear_all_btn = ft.OutlinedButton("Clear All", icon=ft.Icons.DELETE_SWEEP, on_click=self.clear_all, style=ft.ButtonStyle(color=ft.Colors.RED_400))
-        self.export_btn = ft.OutlinedButton("Export CSV", icon=ft.Icons.SAVE_ALT, on_click=self.export_csv)
-
-        main_column = ft.Column(
-            controls=[
-                ft.Container(
-                    content=ft.Row([ft.Icon(ft.Icons.STORE, size=40, color=ft.Colors.BLUE_700),
-                                    ft.Text("Uptown Stationery Manager", size=28, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_900),
-                                    ft.Icon(ft.Icons.SHOPPING_BAG, size=40, color=ft.Colors.BLUE_700)],
-                                   alignment=ft.MainAxisAlignment.CENTER, spacing=10),
-                    margin=ft.margin.only(bottom=20),
-                ),
-                ft.Row([self.name_input, self.price_input, self.add_button], spacing=10),
-                ft.Divider(height=20, color=ft.Colors.TRANSPARENT),
-                ft.Row([self.search_field, self.clear_search_btn], spacing=5),
-                ft.Row([self.stats_text], alignment=ft.MainAxisAlignment.CENTER),
-                ft.Divider(height=10),
-                ft.Text("Your Stationery Inventory:", size=18, weight=ft.FontWeight.W_500),
-                self.items_column,
-                ft.Row([self.clear_all_btn, self.export_btn], alignment=ft.MainAxisAlignment.END, spacing=10),
-            ],
-            spacing=12,
-            expand=True,
-        )
-
-        self.content = main_column
-        self.bgcolor = ft.Colors.GREY_50
-        self.padding = 30
-        self.border_radius = 20
-        self.shadow = ft.BoxShadow(spread_radius=1, blur_radius=15, color=ft.Colors.BLACK12)
-        self.expand = True
-
-        # Do not load data or refresh here – wait for did_mount
+    def __init__(self, user_id: int, username: str, role: str):
+        super().__init__(expand=True)
+        self.user_id  = user_id
+        self.username = username
+        self.role     = role
+        self.cart_items = []
+        self.pos_results_container = None   # assigned in sales_view()
+        self.build_ui()
 
     def did_mount(self):
-        """Called after the control is added to the page."""
-        self._initialized = True
-        self.load_data()
-        self.refresh_items_list()
+        self.on_nav_change(None)
 
-    def save_data(self):
-        with open(DATA_FILE, "w") as f:
-            json.dump([item.to_dict() for item in self.items], f, indent=2)
+    # ------------------------------------------------------------------ build
+    def build_ui(self):
+        self.nav_rail = ft.NavigationRail(
+            selected_index=0,
+            label_type=ft.NavigationRailLabelType.ALL,
+            extended=True,
+            min_width=80,
+            min_extended_width=210,
+            leading=ft.Container(
+                content=ft.Column([
+                    ft.Icon(ft.Icons.STORE, size=30, color=ft.Colors.BLUE_700),
+                    ft.Text(
+                        get_setting("store_name", "Uptown"),
+                        size=13, weight=ft.FontWeight.BOLD,
+                        text_align=ft.TextAlign.CENTER,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                    ),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=4),
+                padding=ft.padding.symmetric(vertical=14, horizontal=8),
+            ),
+            destinations=[
+                ft.NavigationRailDestination(icon=ft.Icons.DASHBOARD,      label="Dashboard"),
+                ft.NavigationRailDestination(icon=ft.Icons.INVENTORY_2,    label="Inventory"),
+                ft.NavigationRailDestination(icon=ft.Icons.POINT_OF_SALE,  label="Sales"),
+                ft.NavigationRailDestination(icon=ft.Icons.ANALYTICS,      label="Reports"),
+                ft.NavigationRailDestination(icon=ft.Icons.LOCAL_SHIPPING, label="Suppliers"),
+                ft.NavigationRailDestination(icon=ft.Icons.GROUP,          label="Customers"),
+                ft.NavigationRailDestination(icon=ft.Icons.SETTINGS,       label="Settings"),
+            ],
+            on_change=self.on_nav_change,
+        )
 
-    def load_data(self):
-        if os.path.exists(DATA_FILE):
-            try:
-                with open(DATA_FILE, "r") as f:
-                    self.items = [StationeryItem.from_dict(d) for d in json.load(f)]
-            except:
-                self.items = []
+        self.dark_mode_switch = ft.Switch(
+            value=get_setting("dark_mode", "false") == "true",
+            on_change=self.toggle_dark_mode,
+            label="Dark",
+        )
 
-    def refresh_items_list(self, filter_text=""):
-        self.cards.clear()
-        self.items_column.controls.clear()
-        filtered = [i for i in self.items if filter_text.lower() in i.name.lower()] if filter_text else self.items
-        for item in filtered:
-            self.cards.append(ItemCard(item, self.on_item_update, self.delete_item_card, self._parent_page))
-            self.items_column.controls.append(self.cards[-1])
-        total_qty = sum(i.quantity for i in self.items)
-        total_val = sum(i.quantity * i.price for i in self.items)
-        self.stats_text.value = f"Total items: {total_qty} | Total value: ${total_val:.2f}"
-        if self._initialized:
-            self.update()
+        top_bar = ft.Container(
+            content=ft.Row([
+                self.dark_mode_switch,
+                ft.Row([
+                    ft.CircleAvatar(
+                        content=ft.Text(self.username[0].upper(), size=14),
+                        bgcolor=ft.Colors.BLUE_700, radius=16,
+                    ),
+                    ft.Column([
+                        ft.Text(self.username, size=13, weight=ft.FontWeight.W_600),
+                        ft.Text(self.role.capitalize(), size=11, color=ft.Colors.GREY_500),
+                    ], spacing=0, tight=True),
+                    ft.IconButton(ft.Icons.LOGOUT, tooltip="Logout", on_click=self.logout),
+                ], spacing=8),
+            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            padding=ft.padding.symmetric(horizontal=20, vertical=8),
+            border=ft.border.only(bottom=ft.border.BorderSide(1, ft.Colors.GREY_300)),
+        )
 
-    def on_item_update(self):
-        self.save_data()
-        self.refresh_items_list(self.search_field.value)
+        self.content_area = ft.Container(expand=True, padding=20, content=ft.Text("Loading…"))
 
-    def delete_item_card(self, card):
-        if card.item in self.items:
-            self.items.remove(card.item)
-            self.save_data()
-            self.refresh_items_list(self.search_field.value)
+        self.content = ft.Column([
+            top_bar,
+            ft.Row([
+                self.nav_rail,
+                ft.VerticalDivider(width=1),
+                self.content_area,
+            ], expand=True, spacing=0),
+        ], expand=True, spacing=0)
 
-    def add_item(self, e):
-        name = self.name_input.value.strip()
-        price_str = self.price_input.value.strip()
-        if not name:
-            self.name_input.error_text = "Name required"
-            self.name_input.update()
-            return
-        self.name_input.error_text = None
+    # ------------------------------------------------------------------ utils
+    def snack(self, msg: str, color=ft.Colors.GREEN_700):
+        self.page.snack_bar = ft.SnackBar(ft.Text(msg), bgcolor=color)
+        self.page.snack_bar.open = True
+        self.page.update()
+
+    def safe_update(self):
         try:
-            price = float(price_str) if price_str else 0.0
-        except:
-            price = 0.0
+            if self.page:
+                self.update()
+        except Exception:
+            pass
 
-        for existing in self.items:
-            if existing.name.lower() == name.lower():
-                existing.quantity += 1
-                self.save_data()
-                self.refresh_items_list(self.search_field.value)
-                self.name_input.value = ""
-                self.price_input.value = ""
-                self.name_input.focus()
+    def close_dialog(self, dialog):
+        dialog.open = False
+        self.page.update()
+
+    def on_nav_change(self, e):
+        idx = self.nav_rail.selected_index
+        fn = {
+            0: self.dashboard_view,
+            1: self.inventory_view,
+            2: self.sales_view,
+            3: self.reports_view,
+            4: self.suppliers_view,
+            5: self.customers_view,
+            6: self.settings_view,
+        }.get(idx, lambda: ft.Text("Not implemented"))
+        self.content_area.content = fn()
+        self.safe_update()
+
+    def dashboard_view(self):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+
+        c.execute("SELECT COALESCE(SUM(quantity),0) FROM items")
+        total_qty = c.fetchone()[0]
+
+        c.execute("SELECT COALESCE(SUM(quantity*price),0.0) FROM items")
+        total_val = c.fetchone()[0]
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        c.execute("SELECT COALESCE(SUM(total),0.0) FROM sales WHERE DATE(sale_date)=?", (today,))
+        today_rev = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM sales WHERE DATE(sale_date)=?", (today,))
+        today_cnt = c.fetchone()[0]
+
+        c.execute("""
+            SELECT s.id, s.sale_date, COALESCE(cu.name,'Walk-in'), s.total, s.payment_method
+            FROM sales s LEFT JOIN customers cu ON s.customer_id=cu.id
+            ORDER BY s.sale_date DESC LIMIT 8
+        """)
+        recent_sales = c.fetchall()
+
+        c.execute("""
+            SELECT name, quantity, low_stock_threshold FROM items
+            WHERE quantity <= low_stock_threshold
+            ORDER BY quantity ASC LIMIT 6
+        """)
+        low_items = c.fetchall()
+        conn.close()
+
+        sym = currency_symbol()
+
+        def stat_card(title, value, bg, icon):
+            return ft.Card(
+                content=ft.Container(
+                    ft.Row([
+                        ft.Container(
+                            ft.Icon(icon, color=ft.Colors.WHITE, size=26),
+                            bgcolor=bg, border_radius=10, padding=12,
+                        ),
+                        ft.Column([
+                            ft.Text(title, size=13, color=ft.Colors.GREY_500),
+                            ft.Text(value, size=24, weight=ft.FontWeight.BOLD),
+                        ], spacing=2, tight=True),
+                    ], spacing=14),
+                    padding=ft.padding.symmetric(horizontal=18, vertical=14),
+                ),
+                elevation=3, expand=True,
+            )
+
+        empty5 = [ft.DataRow(cells=[ft.DataCell(ft.Text("—"))] * 5)]
+        empty3 = [ft.DataRow(cells=[ft.DataCell(ft.Text("—"))] * 3)]
+
+        recent_rows = [
+            ft.DataRow(cells=[
+                ft.DataCell(ft.Text(f"#{sid}", weight=ft.FontWeight.W_500)),
+                ft.DataCell(ft.Text((sdate or "")[:16], size=12)),
+                ft.DataCell(ft.Text(cname)),
+                ft.DataCell(ft.Text(f"{sym}{tot:.2f}", color=ft.Colors.GREEN_700,
+                                    weight=ft.FontWeight.W_600)),
+                ft.DataCell(ft.Container(
+                    ft.Text(pay or "Cash", size=11, color=ft.Colors.WHITE),
+                    bgcolor=ft.Colors.BLUE_700, border_radius=6,
+                    padding=ft.padding.symmetric(horizontal=7, vertical=2),
+                )),
+            ])
+            for sid, sdate, cname, tot, pay in recent_sales
+        ] or empty5
+
+        low_rows = [
+            ft.DataRow(cells=[
+                ft.DataCell(ft.Text(name, weight=ft.FontWeight.W_500)),
+                ft.DataCell(ft.Text(str(qty), color=ft.Colors.RED_700,
+                                    weight=ft.FontWeight.BOLD)),
+                ft.DataCell(ft.Text(str(thr), color=ft.Colors.GREY_600)),
+            ])
+            for name, qty, thr in low_items
+        ] or [ft.DataRow(cells=[
+            ft.DataCell(ft.Text("All stock levels OK ✓", color=ft.Colors.GREEN_700)),
+            ft.DataCell(ft.Text("")), ft.DataCell(ft.Text("")),
+        ])]
+
+        return ft.Column([
+            ft.Text("Dashboard", size=26, weight=ft.FontWeight.BOLD),
+            ft.Row([
+                stat_card("Total Stock",     f"{total_qty:,} units",   ft.Colors.BLUE_700,   ft.Icons.INVENTORY_2),
+                stat_card("Inventory Value", f"{sym}{total_val:,.2f}", ft.Colors.GREEN_700,  ft.Icons.ATTACH_MONEY),
+                stat_card("Today Revenue",   f"{sym}{today_rev:,.2f}", ft.Colors.INDIGO_700, ft.Icons.TRENDING_UP),
+                stat_card("Today's Sales",   str(today_cnt),           ft.Colors.ORANGE_700, ft.Icons.RECEIPT_LONG),
+            ], spacing=14),
+            ft.Row([
+                ft.Card(
+                    content=ft.Container(ft.Column([
+                        ft.Text("Recent Sales", size=15, weight=ft.FontWeight.W_600),
+                        ft.Divider(height=6),
+                        ft.DataTable(
+                            columns=[ft.DataColumn(ft.Text(h))
+                                     for h in ("ID", "Date", "Customer", "Total", "Payment")],
+                            rows=recent_rows,
+                            data_row_max_height=40,
+                        ),
+                    ], spacing=6), padding=14),
+                    elevation=2, expand=True,
+                ),
+                ft.Card(
+                    content=ft.Container(ft.Column([
+                        ft.Row([
+                            ft.Icon(ft.Icons.WARNING_AMBER, color=ft.Colors.ORANGE_700, size=18),
+                            ft.Text("Low Stock", size=15, weight=ft.FontWeight.W_600,
+                                    color=ft.Colors.ORANGE_700),
+                        ], spacing=6),
+                        ft.Divider(height=6),
+                        ft.DataTable(
+                            columns=[ft.DataColumn(ft.Text(h)) for h in ("Item", "Qty", "Min")],
+                            rows=low_rows,
+                            data_row_max_height=40,
+                        ),
+                    ], spacing=6), padding=14),
+                    elevation=2, width=340,
+                ),
+            ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.START),
+        ], spacing=18, scroll=ft.ScrollMode.AUTO)
+
+    def inventory_view(self):
+        self.inv_search = ft.TextField(
+            hint_text="Search by name or barcode…",
+            expand=True, prefix_icon=ft.Icons.SEARCH, height=45,
+            border_radius=8, on_change=self.refresh_items,
+        )
+        self.filter_category = ft.Dropdown(
+            width=175, hint_text="All Categories", height=45,
+            on_change=self.refresh_items,
+        )
+        self.item_table = ft.DataTable(
+            columns=[
+                ft.DataColumn(ft.Text("Item Name")),
+                ft.DataColumn(ft.Text("Category")),
+                ft.DataColumn(ft.Text("Barcode")),
+                ft.DataColumn(ft.Text("Stock"),   numeric=True),
+                ft.DataColumn(ft.Text("Price"),   numeric=True),
+                ft.DataColumn(ft.Text("Cost"),    numeric=True),
+                ft.DataColumn(ft.Text("Margin"),  numeric=True),
+                ft.DataColumn(ft.Text("Supplier")),
+                ft.DataColumn(ft.Text("Actions")),
+            ],
+            border=ft.border.all(1, ft.Colors.GREY_300),
+            border_radius=8, data_row_max_height=50, column_spacing=16,
+        )
+        self.load_categories()
+        self.refresh_items()
+
+        return ft.Column([
+            ft.Text("Inventory", size=26, weight=ft.FontWeight.BOLD),
+            ft.Row([
+                self.inv_search,
+                self.filter_category,
+                ft.ElevatedButton(
+                    "+ Add Item", icon=ft.Icons.ADD,
+                    style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
+                    on_click=self.add_item_dialog,
+                ),
+                ft.OutlinedButton("Export CSV", icon=ft.Icons.DOWNLOAD, on_click=self.export_items),
+            ], spacing=10),
+            ft.Container(
+                content=ft.Column([self.item_table], scroll=ft.ScrollMode.AUTO),
+                expand=True, border=ft.border.all(1, ft.Colors.GREY_200), border_radius=10,
+            ),
+        ], expand=True, spacing=14)
+
+    def load_categories(self):
+        raw = get_setting("categories", "Pens,Notebooks,Art Supplies,Office Equipment,Other")
+        cats = ["All"] + [x.strip() for x in raw.split(",") if x.strip()]
+        self.filter_category.options = [ft.DropdownOption(c, c) for c in cats]
+        if self.filter_category.page:
+            self.filter_category.update()
+
+    def refresh_items(self, e=None):
+        if not hasattr(self, "item_table"):
+            return
+        search_val = (getattr(self, "inv_search", None) and
+                      (self.inv_search.value or "").strip()) or ""
+        category   = getattr(self, "filter_category", None) and self.filter_category.value
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        q = """
+            SELECT i.id, i.name, i.category, i.barcode, i.quantity,
+                   i.price, i.cost_price, i.low_stock_threshold,
+                   COALESCE(s.name,'—')
+            FROM items i LEFT JOIN suppliers s ON i.supplier_id=s.id
+            WHERE 1=1
+        """
+        params = []
+        if search_val:
+            q += " AND (i.name LIKE ? OR i.barcode LIKE ?)"
+            params += [f"%{search_val}%", f"%{search_val}%"]
+        if category and category != "All":
+            q += " AND i.category=?"
+            params.append(category)
+        q += " ORDER BY i.name"
+        c.execute(q, params)
+        rows = c.fetchall()
+        conn.close()
+
+        sym = currency_symbol()
+        self.item_table.rows.clear()
+        for iid, name, cat, barcode, qty, price, cost, threshold, supplier in rows:
+            is_low = qty <= threshold
+            margin = ((price - cost) / price * 100) if price > 0 else 0.0
+            self.item_table.rows.append(ft.DataRow(
+                color=ft.Colors.RED_50 if is_low else None,
+                cells=[
+                    ft.DataCell(ft.Row([
+                        ft.Text(name, weight=ft.FontWeight.W_500),
+                        ft.Container(
+                            ft.Text("LOW", size=9, color=ft.Colors.WHITE),
+                            bgcolor=ft.Colors.RED_700, border_radius=4,
+                            padding=ft.padding.symmetric(horizontal=5, vertical=1),
+                            visible=is_low,
+                        ),
+                    ], spacing=6, tight=True)),
+                    ft.DataCell(ft.Text(cat or "—")),
+                    ft.DataCell(ft.Text(barcode or "—", size=12, color=ft.Colors.GREY_600)),
+                    ft.DataCell(ft.Text(
+                        str(qty),
+                        color=ft.Colors.RED_700 if is_low else None,
+                        weight=ft.FontWeight.W_600 if is_low else None,
+                    )),
+                    ft.DataCell(ft.Text(f"{sym}{price:.2f}")),
+                    ft.DataCell(ft.Text(f"{sym}{cost:.2f}", color=ft.Colors.GREY_600)),
+                    ft.DataCell(ft.Text(
+                        f"{margin:.0f}%",
+                        color=ft.Colors.GREEN_700 if margin >= 20 else ft.Colors.ORANGE_700,
+                    )),
+                    ft.DataCell(ft.Text(supplier, size=12)),
+                    ft.DataCell(ft.Row([
+                        ft.IconButton(ft.Icons.EDIT, tooltip="Edit",
+                                      on_click=lambda _, x=iid: self.edit_item_dialog(x)),
+                        ft.IconButton(ft.Icons.DELETE, tooltip="Delete",
+                                      icon_color=ft.Colors.RED_400,
+                                      on_click=lambda _, x=iid: self.delete_item(x)),
+                    ], tight=True)),
+                ],
+            ))
+        self.safe_update()
+
+    # ---------- shared item form
+    def _item_fields(self, data=None):
+        """data tuple: (id,name,category,barcode,quantity,price,cost_price,low_stock_threshold,supplier_id)"""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, name FROM suppliers ORDER BY name")
+        suppliers = c.fetchall()
+        conn.close()
+
+        raw_cats = get_setting("categories", "Pens,Notebooks,Art Supplies,Office Equipment,Other")
+        cats = [x.strip() for x in raw_cats.split(",") if x.strip()]
+
+        return {
+            "name":      ft.TextField(label="Item Name *",          expand=True, value=data[1] if data else ""),
+            "category":  ft.Dropdown(label="Category",              expand=True,
+                                     options=[ft.DropdownOption(x, x) for x in cats],
+                                     value=data[2] if data else None),
+            "barcode":   ft.TextField(label="Barcode",              expand=True, value=data[3] if data else ""),
+            "price":     ft.TextField(label="Selling Price *",       expand=True,
+                                      keyboard_type=ft.KeyboardType.NUMBER,
+                                      value=str(data[5]) if data else "0"),
+            "cost":      ft.TextField(label="Cost Price",           expand=True,
+                                      keyboard_type=ft.KeyboardType.NUMBER,
+                                      value=str(data[6]) if data else "0"),
+            "qty":       ft.TextField(label="Quantity",             expand=True,
+                                      keyboard_type=ft.KeyboardType.NUMBER,
+                                      value=str(data[4]) if data else "0"),
+            "threshold": ft.TextField(label="Low-stock alert at",   expand=True,
+                                      keyboard_type=ft.KeyboardType.NUMBER,
+                                      value=str(data[7]) if data else "5"),
+            "supplier":  ft.Dropdown(label="Supplier",              expand=True,
+                                     options=[ft.DropdownOption(str(s[0]), s[1]) for s in suppliers],
+                                     value=str(data[8]) if (data and data[8]) else None),
+        }
+
+    def _item_form_content(self, f):
+        return ft.Column([
+            ft.Row([f["name"],     f["category"]],  spacing=12),
+            ft.Row([f["barcode"],  f["supplier"]],   spacing=12),
+            ft.Row([f["price"],    f["cost"]],        spacing=12),
+            ft.Row([f["qty"],      f["threshold"]],   spacing=12),
+        ], spacing=12, width=580, height=300)
+
+    def add_item_dialog(self, e):
+        f = self._item_fields()
+
+        def save(_e):
+            if not (f["name"].value or "").strip():
+                f["name"].error_text = "Required"; f["name"].update(); return
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                cur = conn.cursor()
+                cur.execute(
+                    """INSERT INTO items
+                       (name,category,barcode,price,cost_price,quantity,low_stock_threshold,supplier_id)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (f["name"].value.strip(), f["category"].value,
+                     (f["barcode"].value or "").strip(),
+                     float(f["price"].value or 0),   float(f["cost"].value or 0),
+                     int(f["qty"].value or 0),        int(f["threshold"].value or 5),
+                     int(f["supplier"].value) if f["supplier"].value else None),
+                )
+                conn.commit()
+                log_audit(self.user_id, "ADD_ITEM", f"Added {f['name'].value}")
+                conn.close()
+                dialog.open = False
+                self.refresh_items()
+                self.snack("Item added")
+                self.page.update()
+            except Exception as ex:
+                self.snack(f"Error: {ex}", ft.Colors.RED_700)
+
+        dialog = ft.AlertDialog(
+            title=ft.Text("Add New Item", size=18, weight=ft.FontWeight.BOLD),
+            content=self._item_form_content(f),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: self.close_dialog(dialog)),
+                ft.ElevatedButton("Save Item", on_click=save,
+                                  style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700,
+                                                       color=ft.Colors.WHITE)),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.dialog = dialog
+        dialog.open = True
+        self.page.update()
+
+    def edit_item_dialog(self, item_id):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""SELECT id,name,category,barcode,quantity,price,cost_price,
+                            low_stock_threshold,supplier_id
+                     FROM items WHERE id=?""", (item_id,))
+        data = c.fetchone()
+        conn.close()
+        if not data:
+            return
+
+        f = self._item_fields(data)
+
+        def save(_e):
+            if not (f["name"].value or "").strip():
+                f["name"].error_text = "Required"; f["name"].update(); return
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                cur = conn.cursor()
+                cur.execute(
+                    """UPDATE items SET name=?,category=?,barcode=?,price=?,cost_price=?,
+                                        quantity=?,low_stock_threshold=?,supplier_id=?
+                       WHERE id=?""",
+                    (f["name"].value.strip(), f["category"].value,
+                     (f["barcode"].value or "").strip(),
+                     float(f["price"].value or 0),   float(f["cost"].value or 0),
+                     int(f["qty"].value or 0),        int(f["threshold"].value or 5),
+                     int(f["supplier"].value) if f["supplier"].value else None,
+                     item_id),
+                )
+                conn.commit()
+                log_audit(self.user_id, "EDIT_ITEM", f"Edited item #{item_id}")
+                conn.close()
+                dialog.open = False
+                self.refresh_items()
+                self.snack("Item updated")
+                self.page.update()
+            except Exception as ex:
+                self.snack(f"Error: {ex}", ft.Colors.RED_700)
+
+        dialog = ft.AlertDialog(
+            title=ft.Text(f"Edit — {data[1]}", size=18, weight=ft.FontWeight.BOLD),
+            content=self._item_form_content(f),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: self.close_dialog(dialog)),
+                ft.ElevatedButton("Update", on_click=save,
+                                  style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700,
+                                                       color=ft.Colors.WHITE)),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.dialog = dialog
+        dialog.open = True
+        self.page.update()
+
+    def delete_item(self, item_id):
+        def confirm(_e):
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("DELETE FROM items WHERE id=?", (item_id,))
+            conn.commit()
+            log_audit(self.user_id, "DELETE_ITEM", f"Deleted item #{item_id}")
+            conn.close()
+            dialog.open = False
+            self.refresh_items()
+            self.snack("Item deleted", ft.Colors.RED_700)
+            self.page.update()
+
+        dialog = ft.AlertDialog(
+            title=ft.Text("Confirm Delete"),
+            content=ft.Text("Permanently delete this item?"),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: self.close_dialog(dialog)),
+                ft.ElevatedButton("Delete", on_click=confirm,
+                                  style=ft.ButtonStyle(bgcolor=ft.Colors.RED_700,
+                                                       color=ft.Colors.WHITE)),
+            ],
+        )
+        self.page.dialog = dialog
+        dialog.open = True
+        self.page.update()
+
+    def export_items(self, e):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT name,category,barcode,price,cost_price,quantity,low_stock_threshold FROM items")
+        rows = c.fetchall()
+        conn.close()
+        filename = f"items_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        with open(filename, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["Name", "Category", "Barcode", "Price", "Cost", "Qty", "Min Stock"])
+            w.writerows(rows)
+        self.snack(f"Exported → {filename}")
+
+    def sales_view(self):
+        self.cart_items = []
+
+        self.pos_search = ft.TextField(
+            label="Search item or scan barcode",
+            prefix_icon=ft.Icons.SEARCH,
+            on_change=self._pos_search_changed,
+            expand=True, height=48,
+        )
+        self.pos_results = ft.ListView(spacing=2, height=170)
+        # Store container reference directly — no fragile tree-walking
+        self.pos_results_container = ft.Container(
+            content=self.pos_results,
+            border=ft.border.all(1, ft.Colors.GREY_300),
+            border_radius=8, visible=False, padding=4,
+        )
+
+        self.cart_list = ft.ListView(spacing=6, expand=True, padding=4)
+        sym = currency_symbol()
+        self.cart_total_text = ft.Text(f"{sym}0.00", size=28,
+                                       weight=ft.FontWeight.BOLD,
+                                       color=ft.Colors.BLUE_700)
+        self.subtotal_text = ft.Text(f"Subtotal:  {sym}0.00", size=13, color=ft.Colors.GREY_600)
+        self.discount_text = ft.Text(f"Discount:  -{sym}0.00", size=13, color=ft.Colors.GREY_600)
+        self.tax_text      = ft.Text(f"Tax:       {sym}0.00", size=13, color=ft.Colors.GREY_600)
+
+        self.discount_field = ft.TextField(
+            label="Discount ($)", value="0",
+            keyboard_type=ft.KeyboardType.NUMBER,
+            width=132, height=45, on_change=self._recalculate,
+        )
+        self.tax_field = ft.TextField(
+            label="Tax (%)", value=get_setting("tax_rate", "0"),
+            keyboard_type=ft.KeyboardType.NUMBER,
+            width=132, height=45, on_change=self._recalculate,
+        )
+        self.payment_dd = ft.Dropdown(
+            label="Payment", width=160, height=45, value="Cash",
+            options=[ft.DropdownOption(m, m)
+                     for m in ("Cash", "Card", "Mobile Money", "Bank Transfer")],
+        )
+        self.customer_dd = ft.Dropdown(label="Customer", width=200, height=45)
+        self._load_customer_dropdown()
+
+        return ft.Row([
+            ft.Column([
+                ft.Text("Point of Sale", size=22, weight=ft.FontWeight.BOLD),
+                self.pos_search,
+                self.pos_results_container,
+                ft.Text("Cart", size=15, weight=ft.FontWeight.W_600),
+                ft.Container(
+                    content=self.cart_list,
+                    border=ft.border.all(1, ft.Colors.GREY_300),
+                    border_radius=10, expand=True, padding=6,
+                ),
+            ], expand=True, spacing=8),
+
+            ft.VerticalDivider(width=1),
+
+            ft.Container(
+                content=ft.Column([
+                    ft.Text("Order Summary", size=17, weight=ft.FontWeight.BOLD),
+                    ft.Divider(),
+                    self.customer_dd,
+                    ft.Row([self.discount_field, self.tax_field], spacing=10),
+                    self.payment_dd,
+                    ft.Divider(),
+                    self.subtotal_text,
+                    self.discount_text,
+                    self.tax_text,
+                    ft.Divider(),
+                    ft.Row([
+                        ft.Text("TOTAL", size=15, weight=ft.FontWeight.BOLD),
+                        self.cart_total_text,
+                    ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                    ft.Container(height=8),
+                    ft.ElevatedButton(
+                        "Complete Sale", icon=ft.Icons.PAYMENT,
+                        height=50, expand=True,
+                        style=ft.ButtonStyle(
+                            bgcolor=ft.Colors.GREEN_700, color=ft.Colors.WHITE,
+                            shape=ft.RoundedRectangleBorder(radius=10),
+                        ),
+                        on_click=self.complete_sale,
+                    ),
+                    ft.OutlinedButton(
+                        "Clear Cart", icon=ft.Icons.CLEAR_ALL,
+                        height=42, expand=True, on_click=self.clear_cart,
+                    ),
+                ], spacing=10, width=255, scroll=ft.ScrollMode.AUTO),
+                padding=16,
+            ),
+        ], expand=True, spacing=0)
+
+    def _load_customer_dropdown(self):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, name FROM customers ORDER BY name")
+        rows = c.fetchall()
+        conn.close()
+        self.customer_dd.options = (
+            [ft.DropdownOption("", "Walk-in Customer")] +
+            [ft.DropdownOption(str(r[0]), r[1]) for r in rows]
+        )
+        self.customer_dd.value = ""
+
+    def _pos_search_changed(self, e):
+        query = (self.pos_search.value or "").strip()
+        if not query:
+            if self.pos_results_container:
+                self.pos_results_container.visible = False
+            self.pos_results.controls.clear()
+            self.safe_update()
+            return
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            """SELECT id,name,price,quantity FROM items
+               WHERE (name LIKE ? OR barcode LIKE ?) AND quantity>0
+               ORDER BY name LIMIT 10""",
+            (f"%{query}%", f"%{query}%"),
+        )
+        rows = c.fetchall()
+        conn.close()
+
+        sym = currency_symbol()
+        self.pos_results.controls.clear()
+        for iid, name, price, qty in rows:
+            self.pos_results.controls.append(ft.ListTile(
+                title=ft.Text(name, size=13),
+                subtitle=ft.Text(f"Stock: {qty}  •  {sym}{price:.2f}",
+                                 size=12, color=ft.Colors.GREY_600),
+                trailing=ft.IconButton(
+                    ft.Icons.ADD_CIRCLE, tooltip="Add to cart",
+                    on_click=lambda _, i=iid, n=name, p=price: self._add_to_cart(i, n, p),
+                ),
+                dense=True,
+            ))
+        if self.pos_results_container:
+            self.pos_results_container.visible = bool(rows)
+        self.safe_update()
+
+    def _add_to_cart(self, item_id, name, price):
+        for ci in self.cart_items:
+            if ci["item_id"] == item_id:
+                ci["qty"] += 1
+                ci["subtotal"] = ci["qty"] * ci["price"]
+                self._rebuild_cart_ui()
+                return
+        self.cart_items.append({"item_id": item_id, "name": name,
+                                 "price": price, "qty": 1, "subtotal": price})
+        self._rebuild_cart_ui()
+
+    def _rebuild_cart_ui(self):
+        sym = currency_symbol()
+        self.cart_list.controls.clear()
+
+        for item in self.cart_items:
+            def make_row(it):
+                qty_field = ft.TextField(
+                    value=str(it["qty"]), width=52, height=34,
+                    keyboard_type=ft.KeyboardType.NUMBER,
+                    text_align=ft.TextAlign.CENTER, border_radius=6,
+                    on_change=lambda ev, x=it: self._qty_typed(x, ev.control.value),
+                )
+                return ft.Container(
+                    content=ft.Row([
+                        ft.Column([
+                            ft.Text(it["name"], size=13, weight=ft.FontWeight.W_500,
+                                    overflow=ft.TextOverflow.ELLIPSIS),
+                            ft.Text(f"{sym}{it['price']:.2f} each", size=11,
+                                    color=ft.Colors.GREY_500),
+                        ], expand=True, spacing=2, tight=True),
+                        ft.Row([
+                            ft.IconButton(ft.Icons.REMOVE, width=28, height=28,
+                                          on_click=lambda _, x=it: self._qty_step(x, -1)),
+                            qty_field,
+                            ft.IconButton(ft.Icons.ADD, width=28, height=28,
+                                          on_click=lambda _, x=it: self._qty_step(x, 1)),
+                        ], spacing=2, tight=True),
+                        ft.Text(f"{sym}{it['subtotal']:.2f}", size=14,
+                                weight=ft.FontWeight.W_600, width=68,
+                                text_align=ft.TextAlign.RIGHT),
+                        ft.IconButton(ft.Icons.CLOSE, icon_size=16,
+                                      icon_color=ft.Colors.RED_400,
+                                      on_click=lambda _, x=it: self._remove_cart_item(x)),
+                    ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    padding=ft.padding.symmetric(horizontal=8, vertical=6),
+                    border=ft.border.all(1, ft.Colors.GREY_200),
+                    border_radius=8,
+                )
+            self.cart_list.controls.append(make_row(item))
+
+        self._recalculate()
+
+    def _qty_step(self, item, delta):
+        item["qty"]     = max(1, item["qty"] + delta)
+        item["subtotal"] = item["qty"] * item["price"]
+        self._rebuild_cart_ui()
+
+    def _qty_typed(self, item, val):
+        try:
+            item["qty"]     = max(1, int(val))
+            item["subtotal"] = item["qty"] * item["price"]
+            self._recalculate()
+        except ValueError:
+            pass
+
+    def _remove_cart_item(self, item):
+        self.cart_items = [ci for ci in self.cart_items if ci["item_id"] != item["item_id"]]
+        self._rebuild_cart_ui()
+
+    def _recalculate(self, e=None):
+        sym = currency_symbol()
+        subtotal = sum(ci["subtotal"] for ci in self.cart_items)
+        try:    discount = max(0.0, float(self.discount_field.value or 0))
+        except: discount = 0.0
+        try:    tax_pct  = max(0.0, float(self.tax_field.value or 0))
+        except: tax_pct  = 0.0
+        tax   = (subtotal - discount) * tax_pct / 100
+        total = max(0.0, subtotal - discount + tax)
+        self.subtotal_text.value  = f"Subtotal:  {sym}{subtotal:.2f}"
+        self.discount_text.value  = f"Discount:  -{sym}{discount:.2f}"
+        self.tax_text.value       = f"Tax ({tax_pct:.0f}%): {sym}{tax:.2f}"
+        self.cart_total_text.value = f"{sym}{total:.2f}"
+        self.safe_update()
+
+    def complete_sale(self, e):
+        if not self.cart_items:
+            self.snack("Cart is empty!", ft.Colors.ORANGE_700)
+            return
+
+        sym = currency_symbol()
+        subtotal = sum(ci["subtotal"] for ci in self.cart_items)
+        try:    discount = max(0.0, float(self.discount_field.value or 0))
+        except: discount = 0.0
+        try:    tax_pct  = max(0.0, float(self.tax_field.value or 0))
+        except: tax_pct  = 0.0
+        tax   = (subtotal - discount) * tax_pct / 100
+        total = max(0.0, subtotal - discount + tax)
+
+        customer_id = None
+        try:
+            if self.customer_dd.value:
+                customer_id = int(self.customer_dd.value)
+        except (ValueError, TypeError):
+            pass
+        payment = self.payment_dd.value or "Cash"
+
+        conn = sqlite3.connect(DB_FILE)
+        cur  = conn.cursor()
+        for ci in self.cart_items:
+            cur.execute("SELECT quantity FROM items WHERE id=?", (ci["item_id"],))
+            row = cur.fetchone()
+            if not row or row[0] < ci["qty"]:
+                conn.close()
+                self.snack(f"Insufficient stock: {ci['name']}", ft.Colors.RED_700)
                 return
 
-        self.items.append(StationeryItem(name, 1, price))
-        self.save_data()
-        self.refresh_items_list(self.search_field.value)
-        self.name_input.value = ""
-        self.price_input.value = ""
-        self.name_input.focus()
-
-    def filter_items(self, e):
-        self.refresh_items_list(self.search_field.value)
-
-    def clear_search(self, e):
-        self.search_field.value = ""
-        self.refresh_items_list("")
-
-    def clear_all(self, e):
-        if not self.items:
-            return
-        def confirm(e):
-            self.items.clear()
-            self.save_data()
-            self.refresh_items_list("")
-            dialog.open = False
-            self.update()
-        dialog = ft.AlertDialog(
-            title=ft.Text("Clear All"),
-            content=ft.Text("Delete ALL items? Cannot undo."),
-            actions=[ft.TextButton("Cancel", on_click=lambda e: setattr(dialog, 'open', False)),
-                     ft.ElevatedButton("Yes", on_click=confirm, bgcolor=ft.Colors.RED_400)],
+        cur.execute(
+            """INSERT INTO sales (customer_id,subtotal,discount,tax,total,payment_method,user_id)
+               VALUES (?,?,?,?,?,?,?)""",
+            (customer_id, subtotal, discount, tax, total, payment, self.user_id),
         )
-        self._parent_page.dialog = dialog
-        dialog.open = True
-        self._parent_page.update()
+        sale_id = cur.lastrowid
+        for ci in self.cart_items:
+            cur.execute(
+                "INSERT INTO sale_items (sale_id,item_id,quantity,price_at_sale,total) VALUES (?,?,?,?,?)",
+                (sale_id, ci["item_id"], ci["qty"], ci["price"], ci["subtotal"]),
+            )
+            cur.execute("UPDATE items SET quantity=quantity-? WHERE id=?",
+                        (ci["qty"], ci["item_id"]))
+        if customer_id:
+            cur.execute(
+                "UPDATE customers SET loyalty_points=loyalty_points+?, total_spent=total_spent+? WHERE id=?",
+                (int(total), total, customer_id),
+            )
+        conn.commit()
+        log_audit(self.user_id, "SALE", f"Sale #{sale_id} — {sym}{total:.2f}")
+        conn.close()
 
-    def export_csv(self, e):
-        if not self.items:
-            self._parent_page.snack_bar = ft.SnackBar(ft.Text("No items to export"), bgcolor=ft.Colors.ORANGE_400)
-            self._parent_page.snack_bar.open = True
-            self._parent_page.update()
+        self.snack(f"Sale #{sale_id} completed — {sym}{total:.2f}")
+        self.clear_cart(None)
+
+    def clear_cart(self, e):
+        self.cart_items.clear()
+        self.cart_list.controls.clear()
+        sym = currency_symbol()
+        self.cart_total_text.value = f"{sym}0.00"
+        self.subtotal_text.value   = f"Subtotal:  {sym}0.00"
+        self.discount_text.value   = f"Discount:  -{sym}0.00"
+        self.tax_text.value        = f"Tax:       {sym}0.00"
+        self.discount_field.value  = "0"
+        self.safe_update()
+
+    # ================================================================ REPORTS
+    def reports_view(self):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+
+        c.execute("""
+            SELECT DATE(sale_date), COUNT(*), COALESCE(SUM(total),0)
+            FROM sales WHERE sale_date >= DATE('now','-6 days')
+            GROUP BY DATE(sale_date) ORDER BY 1
+        """)
+        daily = c.fetchall()
+
+        c.execute("""
+            SELECT i.name, COALESCE(SUM(si.quantity),0), COALESCE(SUM(si.total),0)
+            FROM sale_items si JOIN items i ON si.item_id=i.id
+            GROUP BY si.item_id ORDER BY SUM(si.total) DESC LIMIT 10
+        """)
+        top_products = c.fetchall()
+
+        c.execute("""
+            SELECT strftime('%Y-%m',sale_date), COUNT(*),
+                   COALESCE(SUM(total),0), COALESCE(SUM(discount),0)
+            FROM sales GROUP BY 1 ORDER BY 1 DESC LIMIT 6
+        """)
+        monthly = c.fetchall()
+
+        c.execute("SELECT payment_method, COUNT(*), COALESCE(SUM(total),0) FROM sales GROUP BY 1")
+        payments = c.fetchall()
+        conn.close()
+
+        sym = currency_symbol()
+
+        def tbl_card(title, headers, rows):
+            empty = [ft.DataRow(cells=[ft.DataCell(ft.Text("No data yet"))] +
+                                [ft.DataCell(ft.Text(""))] * (len(headers) - 1))]
+            return ft.Card(
+                content=ft.Container(ft.Column([
+                    ft.Text(title, size=15, weight=ft.FontWeight.W_600),
+                    ft.Divider(height=6),
+                    ft.DataTable(
+                        columns=[ft.DataColumn(ft.Text(h)) for h in headers],
+                        rows=rows or empty,
+                        data_row_max_height=40,
+                    ),
+                ], spacing=6), padding=14),
+                elevation=2,
+            )
+
+        daily_rows = [ft.DataRow(cells=[
+            ft.DataCell(ft.Text(d or "—")),
+            ft.DataCell(ft.Text(str(cnt))),
+            ft.DataCell(ft.Text(f"{sym}{rev:,.2f}", color=ft.Colors.GREEN_700)),
+        ]) for d, cnt, rev in daily]
+
+        top_rows = [ft.DataRow(cells=[
+            ft.DataCell(ft.Text(name, overflow=ft.TextOverflow.ELLIPSIS, width=170)),
+            ft.DataCell(ft.Text(str(int(qty)))),
+            ft.DataCell(ft.Text(f"{sym}{rev:,.2f}", color=ft.Colors.GREEN_700,
+                                weight=ft.FontWeight.W_600)),
+        ]) for name, qty, rev in top_products]
+
+        monthly_rows = [ft.DataRow(cells=[
+            ft.DataCell(ft.Text(m)),
+            ft.DataCell(ft.Text(str(cnt))),
+            ft.DataCell(ft.Text(f"{sym}{rev:,.2f}", color=ft.Colors.GREEN_700)),
+            ft.DataCell(ft.Text(f"{sym}{disc:,.2f}", color=ft.Colors.ORANGE_700)),
+        ]) for m, cnt, rev, disc in monthly]
+
+        pay_rows = [ft.DataRow(cells=[
+            ft.DataCell(ft.Text(pm or "Cash")),
+            ft.DataCell(ft.Text(str(cnt))),
+            ft.DataCell(ft.Text(f"{sym}{rev:,.2f}")),
+        ]) for pm, cnt, rev in payments]
+
+        return ft.Column([
+            ft.Text("Reports", size=26, weight=ft.FontWeight.BOLD),
+            ft.Row([
+                tbl_card("Sales — Last 7 Days",    ("Date",    "Sales",    "Revenue"),              daily_rows),
+                tbl_card("Payment Breakdown",       ("Method",  "Count",    "Total"),                pay_rows),
+            ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.START),
+            ft.Row([
+                tbl_card("Top Products",            ("Product", "Qty Sold", "Revenue"),              top_rows),
+                tbl_card("Monthly Summary",         ("Month",   "Sales",    "Revenue", "Discount"),  monthly_rows),
+            ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.START),
+        ], spacing=18, scroll=ft.ScrollMode.AUTO)
+
+    def suppliers_view(self):
+        self.supplier_table = ft.DataTable(
+            columns=[ft.DataColumn(ft.Text(h))
+                     for h in ("Name", "Contact", "Phone", "Email", "Address", "Actions")],
+            border=ft.border.all(1, ft.Colors.GREY_300),
+            border_radius=8, data_row_max_height=52,
+        )
+        self.refresh_suppliers()
+        return ft.Column([
+            ft.Text("Suppliers", size=26, weight=ft.FontWeight.BOLD),
+            ft.Row([
+                ft.ElevatedButton("+ Add Supplier", icon=ft.Icons.ADD,
+                    style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
+                    on_click=self.add_supplier_dialog),
+            ]),
+            ft.Container(
+                content=ft.Column([self.supplier_table], scroll=ft.ScrollMode.AUTO),
+                expand=True,
+                border=ft.border.all(1, ft.Colors.GREY_200), border_radius=10,
+            ),
+        ], expand=True, spacing=14)
+
+    def refresh_suppliers(self, e=None):
+        if not hasattr(self, "supplier_table"):
             return
-        filename = f"stationery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        with open(filename, "w") as f:
-            f.write("Name,Quantity,Price,Total\n")
-            for item in self.items:
-                f.write(f'"{item.name}",{item.quantity},{item.price:.2f},{item.quantity * item.price:.2f}\n')
-        self._parent_page.snack_bar = ft.SnackBar(ft.Text(f"Exported to {filename}"), bgcolor=ft.Colors.GREEN_400)
-        self._parent_page.snack_bar.open = True
-        self._parent_page.update()
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id,name,contact_person,phone,email,address FROM suppliers ORDER BY name")
+        rows = c.fetchall()
+        conn.close()
+        self.supplier_table.rows.clear()
+        for sid, name, contact, phone, email, address in rows:
+            self.supplier_table.rows.append(ft.DataRow(cells=[
+                ft.DataCell(ft.Text(name,    weight=ft.FontWeight.W_500)),
+                ft.DataCell(ft.Text(contact  or "—")),
+                ft.DataCell(ft.Text(phone    or "—")),
+                ft.DataCell(ft.Text(email    or "—")),
+                ft.DataCell(ft.Text(address  or "—", overflow=ft.TextOverflow.ELLIPSIS, width=130)),
+                ft.DataCell(ft.Row([
+                    ft.IconButton(ft.Icons.EDIT,   on_click=lambda _, x=sid: self.edit_supplier_dialog(x)),
+                    ft.IconButton(ft.Icons.DELETE, icon_color=ft.Colors.RED_400,
+                                  on_click=lambda _, x=sid: self.delete_supplier(x)),
+                ], tight=True)),
+            ]))
+        self.safe_update()
+
+    def _supplier_dialog(self, title, data=None, on_save=None):
+        # data: (id, name, contact_person, phone, email, address)
+        f = {
+            "name":    ft.TextField(label="Company Name *", expand=True, value=data[1] if data else ""),
+            "contact": ft.TextField(label="Contact Person", expand=True, value=data[2] if data else ""),
+            "phone":   ft.TextField(label="Phone",          expand=True, value=data[3] if data else ""),
+            "email":   ft.TextField(label="Email",          expand=True, value=data[4] if data else ""),
+            "address": ft.TextField(label="Address", expand=True, value=data[5] if data else "",
+                                    multiline=True, min_lines=2),
+        }
+        content = ft.Column([
+            ft.Row([f["name"],  f["contact"]], spacing=12),
+            ft.Row([f["phone"], f["email"]],   spacing=12),
+            f["address"],
+        ], spacing=12, width=500, height=230)
+
+        def save(_e):
+            if not (f["name"].value or "").strip():
+                f["name"].error_text = "Required"; f["name"].update(); return
+            on_save(f, dialog)
+
+        dialog = ft.AlertDialog(
+            title=ft.Text(title, size=18, weight=ft.FontWeight.BOLD),
+            content=content,
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: self.close_dialog(dialog)),
+                ft.ElevatedButton("Save", on_click=save,
+                                  style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700,
+                                                       color=ft.Colors.WHITE)),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.dialog = dialog
+        dialog.open = True
+        self.page.update()
+
+    def add_supplier_dialog(self, e):
+        def on_save(f, dialog):
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("INSERT INTO suppliers (name,contact_person,phone,email,address) VALUES (?,?,?,?,?)",
+                      (f["name"].value.strip(), f["contact"].value,
+                       f["phone"].value, f["email"].value, f["address"].value))
+            conn.commit()
+            conn.close()
+            dialog.open = False
+            self.refresh_suppliers()
+            self.snack("Supplier added")
+            self.page.update()
+        self._supplier_dialog("Add Supplier", on_save=on_save)
+
+    def edit_supplier_dialog(self, sid):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id,name,contact_person,phone,email,address FROM suppliers WHERE id=?", (sid,))
+        data = c.fetchone()
+        conn.close()
+        if not data:
+            return
+
+        def on_save(f, dialog):
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("UPDATE suppliers SET name=?,contact_person=?,phone=?,email=?,address=? WHERE id=?",
+                      (f["name"].value.strip(), f["contact"].value,
+                       f["phone"].value, f["email"].value, f["address"].value, sid))
+            conn.commit()
+            conn.close()
+            dialog.open = False
+            self.refresh_suppliers()
+            self.snack("Supplier updated")
+            self.page.update()
+        self._supplier_dialog(f"Edit — {data[1]}", data=data, on_save=on_save)
+
+    def delete_supplier(self, sid):
+        def confirm(_e):
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("DELETE FROM suppliers WHERE id=?", (sid,))
+            conn.commit()
+            conn.close()
+            dialog.open = False
+            self.refresh_suppliers()
+            self.snack("Supplier deleted", ft.Colors.RED_700)
+            self.page.update()
+        dialog = ft.AlertDialog(
+            title=ft.Text("Delete Supplier"),
+            content=ft.Text("Remove this supplier? Linked items will be unlinked."),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: self.close_dialog(dialog)),
+                ft.ElevatedButton("Delete", on_click=confirm,
+                                  style=ft.ButtonStyle(bgcolor=ft.Colors.RED_700,
+                                                       color=ft.Colors.WHITE)),
+            ],
+        )
+        self.page.dialog = dialog
+        dialog.open = True
+        self.page.update()
+
+    def customers_view(self):
+        self.customer_table = ft.DataTable(
+            columns=[ft.DataColumn(ft.Text(h))
+                     for h in ("Name", "Phone", "Email", "Points", "Spent", "Since", "Actions")],
+            border=ft.border.all(1, ft.Colors.GREY_300),
+            border_radius=8, data_row_max_height=52,
+        )
+        self.refresh_customers()
+        return ft.Column([
+            ft.Text("Customers", size=26, weight=ft.FontWeight.BOLD),
+            ft.Row([
+                ft.ElevatedButton("+ Add Customer", icon=ft.Icons.PERSON_ADD,
+                    style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
+                    on_click=self.add_customer_dialog),
+            ]),
+            ft.Container(
+                content=ft.Column([self.customer_table], scroll=ft.ScrollMode.AUTO),
+                expand=True,
+                border=ft.border.all(1, ft.Colors.GREY_200), border_radius=10,
+            ),
+        ], expand=True, spacing=14)
+
+    def refresh_customers(self, e=None):
+        if not hasattr(self, "customer_table"):
+            return
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id,name,phone,email,loyalty_points,total_spent,created_at FROM customers ORDER BY name")
+        rows = c.fetchall()
+        conn.close()
+        sym = currency_symbol()
+        self.customer_table.rows.clear()
+        for cid, name, phone, email, pts, spent, joined in rows:
+            self.customer_table.rows.append(ft.DataRow(cells=[
+                ft.DataCell(ft.Text(name,  weight=ft.FontWeight.W_500)),
+                ft.DataCell(ft.Text(phone  or "—")),
+                ft.DataCell(ft.Text(email  or "—")),
+                ft.DataCell(ft.Container(
+                    ft.Text(str(pts), color=ft.Colors.WHITE, size=12),
+                    bgcolor=ft.Colors.AMBER_700, border_radius=10,
+                    padding=ft.padding.symmetric(horizontal=7, vertical=2),
+                )),
+                ft.DataCell(ft.Text(f"{sym}{spent:,.2f}", color=ft.Colors.GREEN_700)),
+                ft.DataCell(ft.Text((joined or "")[:10], size=12, color=ft.Colors.GREY_600)),
+                ft.DataCell(ft.Row([
+                    ft.IconButton(ft.Icons.EDIT,   on_click=lambda _, x=cid: self.edit_customer_dialog(x)),
+                    ft.IconButton(ft.Icons.DELETE, icon_color=ft.Colors.RED_400,
+                                  on_click=lambda _, x=cid: self.delete_customer(x)),
+                ], tight=True)),
+            ]))
+        self.safe_update()
+
+    def _customer_dialog(self, title, data=None, on_save=None):
+        # data: (id, name, phone, email)
+        f = {
+            "name":  ft.TextField(label="Full Name *", expand=True, value=data[1] if data else ""),
+            "phone": ft.TextField(label="Phone",        expand=True, value=data[2] if data else ""),
+            "email": ft.TextField(label="Email",        expand=True, value=data[3] if data else ""),
+        }
+        content = ft.Column([
+            f["name"],
+            ft.Row([f["phone"], f["email"]], spacing=12),
+        ], spacing=12, width=440, height=150)
+
+        def save(_e):
+            if not (f["name"].value or "").strip():
+                f["name"].error_text = "Required"; f["name"].update(); return
+            on_save(f, dialog)
+
+        dialog = ft.AlertDialog(
+            title=ft.Text(title, size=18, weight=ft.FontWeight.BOLD),
+            content=content,
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: self.close_dialog(dialog)),
+                ft.ElevatedButton("Save", on_click=save,
+                                  style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700,
+                                                       color=ft.Colors.WHITE)),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.dialog = dialog
+        dialog.open = True
+        self.page.update()
+
+    def add_customer_dialog(self, e):
+        def on_save(f, dialog):
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("INSERT INTO customers (name,phone,email) VALUES (?,?,?)",
+                      (f["name"].value.strip(), f["phone"].value, f["email"].value))
+            conn.commit()
+            conn.close()
+            dialog.open = False
+            self.refresh_customers()
+            if hasattr(self, "customer_dd"):
+                self._load_customer_dropdown()
+            self.snack("Customer added")
+            self.page.update()
+        self._customer_dialog("Add Customer", on_save=on_save)
+
+    def edit_customer_dialog(self, cid):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id,name,phone,email FROM customers WHERE id=?", (cid,))
+        data = c.fetchone()
+        conn.close()
+        if not data:
+            return
+
+        def on_save(f, dialog):
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("UPDATE customers SET name=?,phone=?,email=? WHERE id=?",
+                      (f["name"].value.strip(), f["phone"].value, f["email"].value, cid))
+            conn.commit()
+            conn.close()
+            dialog.open = False
+            self.refresh_customers()
+            self.snack("Customer updated")
+            self.page.update()
+        self._customer_dialog(f"Edit — {data[1]}", data=data, on_save=on_save)
+
+    def delete_customer(self, cid):
+        def confirm(_e):
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("DELETE FROM customers WHERE id=?", (cid,))
+            conn.commit()
+            conn.close()
+            dialog.open = False
+            self.refresh_customers()
+            self.snack("Customer deleted", ft.Colors.RED_700)
+            self.page.update()
+        dialog = ft.AlertDialog(
+            title=ft.Text("Delete Customer"),
+            content=ft.Text("Remove this customer? Sales history is kept."),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: self.close_dialog(dialog)),
+                ft.ElevatedButton("Delete", on_click=confirm,
+                                  style=ft.ButtonStyle(bgcolor=ft.Colors.RED_700,
+                                                       color=ft.Colors.WHITE)),
+            ],
+        )
+        self.page.dialog = dialog
+        dialog.open = True
+        self.page.update()
+
+    def settings_view(self):
+        store_f = ft.TextField(label="Store Name",
+                               value=get_setting("store_name", "Uptown Stationery"), width=280)
+        tax_f   = ft.TextField(label="Default Tax Rate (%)",
+                               value=get_setting("tax_rate", "0"),
+                               keyboard_type=ft.KeyboardType.NUMBER, width=190)
+        curr_dd = ft.Dropdown(
+            label="Currency", width=190, value=get_setting("currency", "USD"),
+            options=[ft.DropdownOption(x, x) for x in ("USD", "EUR", "GBP", "TZS", "KES")],
+        )
+        cats_f = ft.TextField(
+            label="Product categories (comma-separated)",
+            value=get_setting("categories", "Pens,Notebooks,Art Supplies,Office Equipment,Other"),
+            multiline=True, min_lines=2, width=480,
+        )
+
+        def save_settings(_e):
+            set_setting("store_name", (store_f.value or "").strip() or "Uptown Stationery")
+            set_setting("tax_rate",   tax_f.value or "0")
+            set_setting("currency",   curr_dd.value or "USD")
+            set_setting("categories", cats_f.value or "")
+            self.snack("Settings saved")
+
+        def change_password(_e):
+            old = ft.TextField(label="Current Password",     password=True,
+                               can_reveal_password=True, width=290)
+            nw  = ft.TextField(label="New Password",         password=True,
+                               can_reveal_password=True, width=290)
+            cf  = ft.TextField(label="Confirm New Password", password=True,
+                               can_reveal_password=True, width=290)
+            err = ft.Text("", color=ft.Colors.RED_400)
+
+            def do_change(_ev):
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("SELECT password_hash FROM users WHERE id=?", (self.user_id,))
+                row = c.fetchone()
+                conn.close()
+                if not row or not verify_password(old.value or "", row[0]):
+                    err.value = "Current password is incorrect"; err.update(); return
+                if nw.value != cf.value:
+                    err.value = "Passwords do not match"; err.update(); return
+                if len(nw.value or "") < 4:
+                    err.value = "Min 4 characters"; err.update(); return
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("UPDATE users SET password_hash=? WHERE id=?",
+                          (hash_password(nw.value), self.user_id))
+                conn.commit()
+                conn.close()
+                pw_dlg.open = False
+                self.snack("Password changed")
+                self.page.update()
+
+            pw_dlg = ft.AlertDialog(
+                title=ft.Text("Change Password"),
+                content=ft.Column([old, nw, cf, err], spacing=12, width=310, height=260),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: self.close_dialog(pw_dlg)),
+                    ft.ElevatedButton("Change", on_click=do_change,
+                                      style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700,
+                                                           color=ft.Colors.WHITE)),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+            self.page.dialog = pw_dlg
+            pw_dlg.open = True
+            self.page.update()
+
+        def card(title, ctrls):
+            return ft.Card(
+                content=ft.Container(
+                    ft.Column(
+                        [ft.Text(title, size=15, weight=ft.FontWeight.W_600),
+                         ft.Divider(height=6)] + ctrls,
+                        spacing=12,
+                    ),
+                    padding=18,
+                ),
+                elevation=2,
+            )
+
+        return ft.Column([
+            ft.Text("Settings", size=26, weight=ft.FontWeight.BOLD),
+            card("Store Configuration", [
+                ft.Row([store_f, tax_f, curr_dd], spacing=14, wrap=True),
+                cats_f,
+                ft.ElevatedButton(
+                    "Save Settings", icon=ft.Icons.SAVE, on_click=save_settings,
+                    style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
+                ),
+            ]),
+            card("Security", [
+                ft.ElevatedButton("Change Password", icon=ft.Icons.LOCK,
+                                  on_click=change_password),
+            ]),
+            card("Database", [
+                ft.Row([
+                    ft.ElevatedButton("Backup",  icon=ft.Icons.BACKUP,  on_click=self.backup_db),
+                    ft.ElevatedButton("Restore", icon=ft.Icons.RESTORE, on_click=self.restore_db),
+                ], spacing=12),
+            ]),
+        ], spacing=18, scroll=ft.ScrollMode.AUTO)
+
+    def backup_db(self, e):
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        dest = os.path.join(BACKUP_DIR, f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
+        shutil.copy(DB_FILE, dest)
+        self.snack(f"Backup saved: {dest}")
+
+    def restore_db(self, e):
+        if not os.path.exists(BACKUP_DIR):
+            self.snack("No backups directory found", ft.Colors.ORANGE_700)
+            return
+        backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith(".db")], reverse=True)
+        if not backups:
+            self.snack("No backup files found", ft.Colors.ORANGE_700)
+            return
+
+        bk_list = ft.ListView(spacing=4, height=200)
+
+        def make_restorer(filename):
+            def do_restore(_e):
+                shutil.copy(os.path.join(BACKUP_DIR, filename), DB_FILE)
+                dialog.open = False
+                self.snack(f"Restored from {filename}")
+                self.page.update()
+            return do_restore
+
+        for bfile in backups[:10]:
+            bk_list.controls.append(ft.ListTile(
+                title=ft.Text(bfile, size=13),
+                trailing=ft.TextButton("Restore", on_click=make_restorer(bfile)),
+            ))
+
+        dialog = ft.AlertDialog(
+            title=ft.Text("Select Backup to Restore"),
+            content=ft.Container(bk_list, width=400, height=220),
+            actions=[ft.TextButton("Cancel", on_click=lambda _: self.close_dialog(dialog))],
+        )
+        self.page.dialog = dialog
+        dialog.open = True
+        self.page.update()
+
+    def toggle_dark_mode(self, e):
+        is_dark = self.dark_mode_switch.value
+        set_setting("dark_mode", "true" if is_dark else "false")
+        self.page.theme_mode = ft.ThemeMode.DARK if is_dark else ft.ThemeMode.LIGHT
+        self.page.update()
+
+    def logout(self, e):
+        log_audit(self.user_id, "LOGOUT", f"User {self.username} logged out")
+        self.page.clean()
+        self.page.add(LoginPage(lambda uid, uname, role: (
+            self.page.clean(),
+            self.page.add(StationeryApp(uid, uname, role)),
+            self.page.update(),
+        )))
+        self.page.update()
 
 
 def main(page: ft.Page):
-    page.title = "Uptown Stationery Manager"
-    page.theme_mode = ft.ThemeMode.LIGHT
-    page.padding = 20
-    page.bgcolor = ft.Colors.BLUE_50
-    page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
-    page.vertical_alignment = ft.MainAxisAlignment.CENTER
-    page.window_width = 800
-    page.window_height = 700
-    page.window_min_width = 600
-    page.window_min_height = 500
-    page.add(StationeryApp(page))
+    page.title        = f"{get_setting('store_name', 'Uptown Stationery')} — Manager"
+    page.theme_mode   = (ft.ThemeMode.DARK
+                         if get_setting("dark_mode", "false") == "true"
+                         else ft.ThemeMode.LIGHT)
+    page.padding      = 0
+    page.spacing      = 0
+    page.window_width      = 1300
+    page.window_height     = 840
+    page.window_min_width  = 960
+    page.window_min_height = 660
+
+    page.add(LoginPage(lambda uid, uname, role: (
+        page.clean(),
+        page.add(StationeryApp(uid, uname, role)),
+        page.update(),
+    )))
+    page.update()
+
 
 ft.app(target=main)
