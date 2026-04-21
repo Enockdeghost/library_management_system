@@ -11,6 +11,7 @@ DB_FILE = "stationery.db"
 BACKUP_DIR = "backups"
 
 
+# ====================== DATABASE SETUP ======================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -37,7 +38,6 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         category TEXT,
-        barcode TEXT UNIQUE,
         quantity INTEGER DEFAULT 0,
         price REAL DEFAULT 0.0,
         cost_price REAL DEFAULT 0.0,
@@ -101,6 +101,11 @@ def init_db():
         "INSERT OR IGNORE INTO users (username, password_hash, role, full_name) VALUES (?,?,?,?)",
         ("admin", admin_pwd, "admin", "Administrator"),
     )
+    seller_pwd = hashlib.sha256("seller123".encode()).hexdigest()
+    c.execute(
+        "INSERT OR IGNORE INTO users (username, password_hash, role, full_name) VALUES (?,?,?,?)",
+        ("seller", seller_pwd, "seller", "Sales Person"),
+    )
     for k, v in [
         ("categories", "Pens,Notebooks,Art Supplies,Office Equipment,Other"),
         ("store_name",  "Uptown Stationery"),
@@ -117,6 +122,7 @@ def init_db():
 init_db()
 
 
+# ====================== HELPERS ======================
 def hash_password(pwd: str) -> str:
     return hashlib.sha256(pwd.encode()).hexdigest()
 
@@ -157,6 +163,7 @@ def currency_symbol() -> str:
     )
 
 
+
 class LoginPage(ft.Container):
     def __init__(self, on_login_success):
         super().__init__(expand=True)
@@ -182,7 +189,7 @@ class LoginPage(ft.Container):
                     controls=[
                         ft.Icon(ft.Icons.STORE_MALL_DIRECTORY, size=80, color=ft.Colors.BLUE_700),
                         ft.Text(store_name, size=28, weight=ft.FontWeight.BOLD),
-                        ft.Text("Management System", size=16, color=ft.Colors.GREY_600),
+                        ft.Text("Professional Management System", size=16, color=ft.Colors.GREY_600),
                         ft.Container(height=10),
                         self.username_field,
                         self.password_field,
@@ -196,6 +203,7 @@ class LoginPage(ft.Container):
                             ),
                             on_click=self.do_login,
                         ),
+                        ft.Text("Demo: admin/admin123  seller/seller123", size=12, color=ft.Colors.GREY_500),
                     ],
                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                     spacing=14,
@@ -238,6 +246,7 @@ class LoginPage(ft.Container):
             self.update()
 
 
+# ====================== MAIN APP ======================
 class StationeryApp(ft.Container):
     def __init__(self, user_id: int, username: str, role: str):
         super().__init__(expand=True)
@@ -253,6 +262,22 @@ class StationeryApp(ft.Container):
 
     # ------------------------------------------------------------------ build
     def build_ui(self):
+        is_admin = (self.role == "admin")
+
+        destinations = [
+            ft.NavigationRailDestination(icon=ft.Icons.DASHBOARD,      label="Dashboard"),
+            ft.NavigationRailDestination(icon=ft.Icons.INVENTORY_2,    label="Inventory"),
+            ft.NavigationRailDestination(icon=ft.Icons.POINT_OF_SALE,  label="Sales"),
+            ft.NavigationRailDestination(icon=ft.Icons.ANALYTICS,      label="Reports"),
+        ]
+        if is_admin:
+            destinations.extend([
+                ft.NavigationRailDestination(icon=ft.Icons.LOCAL_SHIPPING, label="Suppliers"),
+                ft.NavigationRailDestination(icon=ft.Icons.GROUP,          label="Customers"),
+                ft.NavigationRailDestination(icon=ft.Icons.PEOPLE,         label="Users"),
+                ft.NavigationRailDestination(icon=ft.Icons.SETTINGS,       label="Settings"),
+            ])
+
         self.nav_rail = ft.NavigationRail(
             selected_index=0,
             label_type=ft.NavigationRailLabelType.ALL,
@@ -269,17 +294,9 @@ class StationeryApp(ft.Container):
                         overflow=ft.TextOverflow.ELLIPSIS,
                     ),
                 ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=4),
-                padding=ft.padding.symmetric(vertical=14, horizontal=8),
+                padding=ft.Padding.symmetric(vertical=14, horizontal=8),
             ),
-            destinations=[
-                ft.NavigationRailDestination(icon=ft.Icons.DASHBOARD,      label="Dashboard"),
-                ft.NavigationRailDestination(icon=ft.Icons.INVENTORY_2,    label="Inventory"),
-                ft.NavigationRailDestination(icon=ft.Icons.POINT_OF_SALE,  label="Sales"),
-                ft.NavigationRailDestination(icon=ft.Icons.ANALYTICS,      label="Reports"),
-                ft.NavigationRailDestination(icon=ft.Icons.LOCAL_SHIPPING, label="Suppliers"),
-                ft.NavigationRailDestination(icon=ft.Icons.GROUP,          label="Customers"),
-                ft.NavigationRailDestination(icon=ft.Icons.SETTINGS,       label="Settings"),
-            ],
+            destinations=destinations,
             on_change=self.on_nav_change,
         )
 
@@ -298,13 +315,13 @@ class StationeryApp(ft.Container):
                         bgcolor=ft.Colors.BLUE_700, radius=16,
                     ),
                     ft.Column([
-                        ft.Text(self.username, size=13, weight=ft.FontWeight.W_600),
-                        ft.Text(self.role.capitalize(), size=11, color=ft.Colors.GREY_500),
+                        ft.Text(f"{self.username} ({self.role})", size=13, weight=ft.FontWeight.W_600),
+                        ft.Text(get_setting("store_name", "Uptown Stationery"), size=11, color=ft.Colors.GREY_500),
                     ], spacing=0, tight=True),
                     ft.IconButton(ft.Icons.LOGOUT, tooltip="Logout", on_click=self.logout),
                 ], spacing=8),
             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-            padding=ft.padding.symmetric(horizontal=20, vertical=8),
+            padding=ft.Padding.symmetric(horizontal=20, vertical=8),
             border=ft.Border.only(bottom=ft.BorderSide(1, ft.Colors.GREY_300)),
         )
 
@@ -339,18 +356,29 @@ class StationeryApp(ft.Container):
 
     def on_nav_change(self, e):
         idx = self.nav_rail.selected_index
-        fn = {
-            0: self.dashboard_view,
-            1: self.inventory_view,
-            2: self.sales_view,
-            3: self.reports_view,
-            4: self.suppliers_view,
-            5: self.customers_view,
-            6: self.settings_view,
-        }.get(idx, lambda: ft.Text("Not implemented"))
+        is_admin = (self.role == "admin")
+        if is_admin:
+            fn = {
+                0: self.dashboard_view,
+                1: self.inventory_view,
+                2: self.sales_view,
+                3: self.reports_view,
+                4: self.suppliers_view,
+                5: self.customers_view,
+                6: self.users_view,
+                7: self.settings_view,
+            }.get(idx, lambda: ft.Text("Not implemented"))
+        else:
+            fn = {
+                0: self.dashboard_view,
+                1: self.inventory_view,
+                2: self.sales_view,
+                3: self.reports_view,
+            }.get(idx, lambda: ft.Text("Not implemented"))
         self.content_area.content = fn()
         self.safe_update()
 
+    # DASHBOARD
     def dashboard_view(self):
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -367,6 +395,20 @@ class StationeryApp(ft.Container):
 
         c.execute("SELECT COUNT(*) FROM sales WHERE DATE(sale_date)=?", (today,))
         today_cnt = c.fetchone()[0]
+
+        c.execute("""
+            SELECT DATE(sale_date), COUNT(*), COALESCE(SUM(total),0)
+            FROM sales WHERE sale_date >= DATE('now','-6 days')
+            GROUP BY DATE(sale_date) ORDER BY 1
+        """)
+        daily_data = c.fetchall()
+
+        c.execute("""
+            SELECT i.name, COALESCE(SUM(si.quantity),0), COALESCE(SUM(si.total),0)
+            FROM sale_items si JOIN items i ON si.item_id=i.id
+            GROUP BY si.item_id ORDER BY SUM(si.total) DESC LIMIT 5
+        """)
+        top_prods = c.fetchall()
 
         c.execute("""
             SELECT s.id, s.sale_date, COALESCE(cu.name,'Walk-in'), s.total, s.payment_method
@@ -398,13 +440,47 @@ class StationeryApp(ft.Container):
                             ft.Text(value, size=24, weight=ft.FontWeight.BOLD),
                         ], spacing=2, tight=True),
                     ], spacing=14),
-                    padding=ft.padding.symmetric(horizontal=18, vertical=14),
+                    padding=ft.Padding.symmetric(horizontal=18, vertical=14),
                 ),
                 elevation=3, expand=True,
             )
 
-        empty5 = [ft.DataRow(cells=[ft.DataCell(ft.Text("—"))] * 5)]
+        def data_table(title, headers, rows):
+            empty = [ft.DataRow(cells=[ft.DataCell(ft.Text("No data"))] * len(headers))]
+            return ft.Card(
+                content=ft.Container(
+                    ft.Column([
+                        ft.Text(title, size=15, weight=ft.FontWeight.W_600),
+                        ft.Divider(height=6),
+                        ft.DataTable(
+                            columns=[ft.DataColumn(ft.Text(h)) for h in headers],
+                            rows=rows or empty,
+                            data_row_max_height=40,
+                        ),
+                    ], spacing=6),
+                    padding=14,
+                ),
+                elevation=2,
+                expand=True,
+            )
 
+        daily_rows = [
+            ft.DataRow(cells=[
+                ft.DataCell(ft.Text(d or "—")),
+                ft.DataCell(ft.Text(str(cnt))),
+                ft.DataCell(ft.Text(f"{sym}{rev:,.2f}", color=ft.Colors.GREEN_700)),
+            ]) for d, cnt, rev in daily_data
+        ]
+
+        top_rows = [
+            ft.DataRow(cells=[
+                ft.DataCell(ft.Text(name, overflow=ft.TextOverflow.ELLIPSIS)),
+                ft.DataCell(ft.Text(str(int(qty)))),
+                ft.DataCell(ft.Text(f"{sym}{rev:,.2f}", color=ft.Colors.GREEN_700, weight=ft.FontWeight.W_600)),
+            ]) for name, qty, rev in top_prods
+        ]
+
+        empty5 = [ft.DataRow(cells=[ft.DataCell(ft.Text("—"))] * 5)]
         recent_rows = [
             ft.DataRow(cells=[
                 ft.DataCell(ft.Text(f"#{sid}", weight=ft.FontWeight.W_500)),
@@ -415,7 +491,7 @@ class StationeryApp(ft.Container):
                 ft.DataCell(ft.Container(
                     ft.Text(pay or "Cash", size=11, color=ft.Colors.WHITE),
                     bgcolor=ft.Colors.BLUE_700, border_radius=6,
-                    padding=ft.padding.symmetric(horizontal=7, vertical=2),
+                    padding=ft.Padding.symmetric(horizontal=7, vertical=2),
                 )),
             ])
             for sid, sdate, cname, tot, pay in recent_sales
@@ -435,13 +511,17 @@ class StationeryApp(ft.Container):
         ])]
 
         return ft.Column([
-            ft.Text("Dashboard", size=26, weight=ft.FontWeight.BOLD),
+            ft.Text("Dashboard", size=28, weight=ft.FontWeight.BOLD),
             ft.Row([
                 stat_card("Total Stock",     f"{total_qty:,} units",   ft.Colors.BLUE_700,   ft.Icons.INVENTORY_2),
                 stat_card("Inventory Value", f"{sym}{total_val:,.2f}", ft.Colors.GREEN_700,  ft.Icons.ATTACH_MONEY),
                 stat_card("Today Revenue",   f"{sym}{today_rev:,.2f}", ft.Colors.INDIGO_700, ft.Icons.TRENDING_UP),
                 stat_card("Today's Sales",   str(today_cnt),           ft.Colors.ORANGE_700, ft.Icons.RECEIPT_LONG),
             ], spacing=14),
+            ft.Row([
+                data_table("Sales — Last 7 Days", ("Date", "Orders", "Revenue"), daily_rows),
+                data_table("Top 5 Products", ("Product", "Qty Sold", "Revenue"), top_rows),
+            ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.START),
             ft.Row([
                 ft.Card(
                     content=ft.Container(ft.Column([
@@ -475,24 +555,24 @@ class StationeryApp(ft.Container):
             ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.START),
         ], spacing=18, scroll=ft.ScrollMode.AUTO)
 
+    # INVENTORY
     def inventory_view(self):
         self.inv_search = ft.TextField(
-            hint_text="Search by name or barcode…",
+            hint_text="Search by name…",
             expand=True, prefix_icon=ft.Icons.SEARCH, height=45,
             border_radius=8,
         )
-        self.inv_search.on_change = self.refresh_items  # set after creation
+        self.inv_search.on_change = self.refresh_items
 
         self.filter_category = ft.Dropdown(
             width=175, hint_text="All Categories", height=45,
         )
-        self.filter_category.on_change = self.refresh_items  # set after creation
+        self.filter_category.on_change = self.refresh_items
 
         self.item_table = ft.DataTable(
             columns=[
                 ft.DataColumn(ft.Text("Item Name")),
                 ft.DataColumn(ft.Text("Category")),
-                ft.DataColumn(ft.Text("Barcode")),
                 ft.DataColumn(ft.Text("Stock"),   numeric=True),
                 ft.DataColumn(ft.Text("Price"),   numeric=True),
                 ft.DataColumn(ft.Text("Cost"),    numeric=True),
@@ -506,25 +586,32 @@ class StationeryApp(ft.Container):
         self.load_categories()
         self.refresh_items()
 
+        add_btn = ft.Button(
+            "+ Add Item", icon=ft.Icons.ADD,
+            style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
+            on_click=self.add_item_dialog,
+        )
+        export_btn = ft.Button(
+            "Export CSV", icon=ft.Icons.DOWNLOAD,
+            style=ft.ButtonStyle(
+                side=ft.BorderSide(width=1, color=ft.Colors.BLUE_700),
+                color=ft.Colors.BLUE_700,
+                shape=ft.RoundedRectangleBorder(radius=8)
+            ),
+            on_click=self.export_items,
+        )
+
+        if self.role != "admin":
+            add_btn.disabled = True
+            add_btn.tooltip = "Admin only"
+
         return ft.Column([
             ft.Text("Inventory", size=26, weight=ft.FontWeight.BOLD),
             ft.Row([
                 self.inv_search,
                 self.filter_category,
-                ft.Button(
-                    "+ Add Item", icon=ft.Icons.ADD,
-                    style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
-                    on_click=self.add_item_dialog,
-                ),
-                ft.Button(
-                    "Export CSV", icon=ft.Icons.DOWNLOAD,
-                    style=ft.ButtonStyle(
-                        side=ft.BorderSide(width=1, color=ft.Colors.BLUE_700),
-                        color=ft.Colors.BLUE_700,
-                        shape=ft.RoundedRectangleBorder(radius=8)
-                    ),
-                    on_click=self.export_items,
-                ),
+                add_btn,
+                export_btn,
             ], spacing=10),
             ft.Container(
                 content=ft.Column([self.item_table], scroll=ft.ScrollMode.AUTO),
@@ -536,7 +623,7 @@ class StationeryApp(ft.Container):
         raw = get_setting("categories", "Pens,Notebooks,Art Supplies,Office Equipment,Other")
         cats = ["All"] + [x.strip() for x in raw.split(",") if x.strip()]
         self.filter_category.options = [ft.dropdown.Option(c, c) for c in cats]
-       
+
     def refresh_items(self, e=None):
         if not hasattr(self, "item_table"):
             return
@@ -547,7 +634,7 @@ class StationeryApp(ft.Container):
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         q = """
-            SELECT i.id, i.name, i.category, i.barcode, i.quantity,
+            SELECT i.id, i.name, i.category, i.quantity,
                    i.price, i.cost_price, i.low_stock_threshold,
                    COALESCE(s.name,'—')
             FROM items i LEFT JOIN suppliers s ON i.supplier_id=s.id
@@ -555,8 +642,8 @@ class StationeryApp(ft.Container):
         """
         params = []
         if search_val:
-            q += " AND (i.name LIKE ? OR i.barcode LIKE ?)"
-            params += [f"%{search_val}%", f"%{search_val}%"]
+            q += " AND i.name LIKE ?"
+            params.append(f"%{search_val}%")
         if category and category != "All":
             q += " AND i.category=?"
             params.append(category)
@@ -567,21 +654,18 @@ class StationeryApp(ft.Container):
 
         sym = currency_symbol()
         self.item_table.rows.clear()
-        for iid, name, cat, barcode, qty, price, cost, threshold, supplier in rows:
+        for iid, name, cat, qty, price, cost, threshold, supplier in rows:
             is_low = qty <= threshold
             margin = ((price - cost) / price * 100) if price > 0 else 0.0
 
-            edit_btn = ft.IconButton(
-                ft.Icons.EDIT, tooltip="Edit",
-                data=iid,
-                on_click=self.on_edit_item_click
-            )
-            delete_btn = ft.IconButton(
-                ft.Icons.DELETE, tooltip="Delete",
-                icon_color=ft.Colors.RED_400,
-                data=iid,
-                on_click=self.on_delete_item_click
-            )
+            actions = []
+            if self.role == "admin":
+                edit_btn = ft.IconButton(ft.Icons.EDIT, tooltip="Edit", data=iid, on_click=self.on_edit_item_click)
+                delete_btn = ft.IconButton(ft.Icons.DELETE, tooltip="Delete", icon_color=ft.Colors.RED_400,
+                                           data=iid, on_click=self.on_delete_item_click)
+                actions = [edit_btn, delete_btn]
+            else:
+                actions = [ft.Text("—")]
 
             self.item_table.rows.append(ft.DataRow(
                 color=ft.Colors.RED_50 if is_low else None,
@@ -591,12 +675,11 @@ class StationeryApp(ft.Container):
                         ft.Container(
                             ft.Text("LOW", size=9, color=ft.Colors.WHITE),
                             bgcolor=ft.Colors.RED_700, border_radius=4,
-                            padding=ft.padding.symmetric(horizontal=5, vertical=1),
+                            padding=ft.Padding.symmetric(horizontal=5, vertical=1),
                             visible=is_low,
                         ),
                     ], spacing=6, tight=True)),
                     ft.DataCell(ft.Text(cat or "—")),
-                    ft.DataCell(ft.Text(barcode or "—", size=12, color=ft.Colors.GREY_600)),
                     ft.DataCell(ft.Text(
                         str(qty),
                         color=ft.Colors.RED_700 if is_low else None,
@@ -609,7 +692,7 @@ class StationeryApp(ft.Container):
                         color=ft.Colors.GREEN_700 if margin >= 20 else ft.Colors.ORANGE_700,
                     )),
                     ft.DataCell(ft.Text(supplier, size=12)),
-                    ft.DataCell(ft.Row([edit_btn, delete_btn], tight=True)),
+                    ft.DataCell(ft.Row(actions, tight=True)),
                 ],
             ))
         self.safe_update()
@@ -638,33 +721,35 @@ class StationeryApp(ft.Container):
             "category":  ft.Dropdown(label="Category",              expand=True,
                                      options=[ft.dropdown.Option(x, x) for x in cats],
                                      value=data[2] if data else None),
-            "barcode":   ft.TextField(label="Barcode",              expand=True, value=data[3] if data else ""),
             "price":     ft.TextField(label="Selling Price *",       expand=True,
                                       keyboard_type=ft.KeyboardType.NUMBER,
-                                      value=str(data[5]) if data else "0"),
+                                      value=str(data[4]) if data else "0"),
             "cost":      ft.TextField(label="Cost Price",           expand=True,
                                       keyboard_type=ft.KeyboardType.NUMBER,
-                                      value=str(data[6]) if data else "0"),
+                                      value=str(data[5]) if data else "0"),
             "qty":       ft.TextField(label="Quantity",             expand=True,
                                       keyboard_type=ft.KeyboardType.NUMBER,
-                                      value=str(data[4]) if data else "0"),
+                                      value=str(data[3]) if data else "0"),
             "threshold": ft.TextField(label="Low-stock alert at",   expand=True,
                                       keyboard_type=ft.KeyboardType.NUMBER,
-                                      value=str(data[7]) if data else "5"),
+                                      value=str(data[6]) if data else "5"),
             "supplier":  ft.Dropdown(label="Supplier",              expand=True,
                                      options=[ft.dropdown.Option(str(s[0]), s[1]) for s in suppliers],
-                                     value=str(data[8]) if (data and data[8]) else None),
+                                     value=str(data[7]) if (data and data[7]) else None),
         }
 
     def _item_form_content(self, f):
         return ft.Column([
             ft.Row([f["name"],     f["category"]],  spacing=12),
-            ft.Row([f["barcode"],  f["supplier"]],   spacing=12),
             ft.Row([f["price"],    f["cost"]],        spacing=12),
             ft.Row([f["qty"],      f["threshold"]],   spacing=12),
-        ], spacing=12, width=580, height=300)
+            f["supplier"],
+        ], spacing=12, width=500, height=320)
 
     def add_item_dialog(self, e):
+        if self.role != "admin":
+            self.snack("Admin access required", ft.Colors.RED_700)
+            return
         f = self._item_fields()
 
         def save(_e):
@@ -675,10 +760,9 @@ class StationeryApp(ft.Container):
                 cur = conn.cursor()
                 cur.execute(
                     """INSERT INTO items
-                       (name,category,barcode,price,cost_price,quantity,low_stock_threshold,supplier_id)
-                       VALUES (?,?,?,?,?,?,?,?)""",
+                       (name,category,price,cost_price,quantity,low_stock_threshold,supplier_id)
+                       VALUES (?,?,?,?,?,?,?)""",
                     (f["name"].value.strip(), f["category"].value,
-                     (f["barcode"].value or "").strip(),
                      float(f["price"].value or 0),   float(f["cost"].value or 0),
                      int(f["qty"].value or 0),        int(f["threshold"].value or 5),
                      int(f["supplier"].value) if f["supplier"].value else None),
@@ -689,7 +773,6 @@ class StationeryApp(ft.Container):
                 self.close_dialog(dialog)
                 self.refresh_items()
                 self.snack("Item added")
-                self.page.update()
             except Exception as ex:
                 self.snack(f"Error: {ex}", ft.Colors.RED_700)
 
@@ -708,9 +791,12 @@ class StationeryApp(ft.Container):
         self.page.update()
 
     def edit_item_dialog(self, item_id):
+        if self.role != "admin":
+            self.snack("Admin access required", ft.Colors.RED_700)
+            return
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("""SELECT id,name,category,barcode,quantity,price,cost_price,
+        c.execute("""SELECT id,name,category,quantity,price,cost_price,
                             low_stock_threshold,supplier_id
                      FROM items WHERE id=?""", (item_id,))
         data = c.fetchone()
@@ -727,11 +813,10 @@ class StationeryApp(ft.Container):
                 conn = sqlite3.connect(DB_FILE)
                 cur = conn.cursor()
                 cur.execute(
-                    """UPDATE items SET name=?,category=?,barcode=?,price=?,cost_price=?,
+                    """UPDATE items SET name=?,category=?,price=?,cost_price=?,
                                         quantity=?,low_stock_threshold=?,supplier_id=?
                        WHERE id=?""",
                     (f["name"].value.strip(), f["category"].value,
-                     (f["barcode"].value or "").strip(),
                      float(f["price"].value or 0),   float(f["cost"].value or 0),
                      int(f["qty"].value or 0),        int(f["threshold"].value or 5),
                      int(f["supplier"].value) if f["supplier"].value else None,
@@ -743,7 +828,6 @@ class StationeryApp(ft.Container):
                 self.close_dialog(dialog)
                 self.refresh_items()
                 self.snack("Item updated")
-                self.page.update()
             except Exception as ex:
                 self.snack(f"Error: {ex}", ft.Colors.RED_700)
 
@@ -762,17 +846,22 @@ class StationeryApp(ft.Container):
         self.page.update()
 
     def delete_item(self, item_id):
+        if self.role != "admin":
+            self.snack("Admin access required", ft.Colors.RED_700)
+            return
         def confirm(_e):
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("DELETE FROM items WHERE id=?", (item_id,))
-            conn.commit()
-            log_audit(self.user_id, "DELETE_ITEM", f"Deleted item #{item_id}")
-            conn.close()
-            self.close_dialog(dialog)
-            self.refresh_items()
-            self.snack("Item deleted", ft.Colors.RED_700)
-            self.page.update()
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("DELETE FROM items WHERE id=?", (item_id,))
+                conn.commit()
+                log_audit(self.user_id, "DELETE_ITEM", f"Deleted item #{item_id}")
+                conn.close()
+                self.close_dialog(dialog)
+                self.refresh_items()
+                self.snack("Item deleted", ft.Colors.RED_700)
+            except Exception as ex:
+                self.snack(f"Failed: {ex}", ft.Colors.RED_700)
 
         dialog = ft.AlertDialog(
             title=ft.Text("Confirm Delete"),
@@ -788,30 +877,31 @@ class StationeryApp(ft.Container):
         self.page.update()
 
     def export_items(self, e):
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT name,category,barcode,price,cost_price,quantity,low_stock_threshold FROM items")
-        rows = c.fetchall()
-        conn.close()
-        filename = f"items_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
         try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("SELECT name,category,price,cost_price,quantity,low_stock_threshold FROM items")
+            rows = c.fetchall()
+            conn.close()
+            filename = f"items_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
             with open(filename, "w", newline="", encoding="utf-8") as fh:
                 w = csv.writer(fh)
-                w.writerow(["Name", "Category", "Barcode", "Price", "Cost", "Qty", "Min Stock"])
+                w.writerow(["Name", "Category", "Price", "Cost", "Qty", "Min Stock"])
                 w.writerows(rows)
             self.snack(f"Exported → {filename}")
         except Exception as ex:
             self.snack(f"Export failed: {ex}", ft.Colors.RED_700)
 
+    # SALES / POS
     def sales_view(self):
         self.cart_items = []
 
         self.pos_search = ft.TextField(
-            label="Search item or scan barcode",
+            label="Search item…",
             prefix_icon=ft.Icons.SEARCH,
             expand=True, height=48,
         )
-        self.pos_search.on_change = self._pos_search_changed  # set after creation
+        self.pos_search.on_change = self._pos_search_changed
 
         self.pos_results = ft.ListView(spacing=2, height=170)
         self.pos_results_container = ft.Container(
@@ -945,30 +1035,33 @@ class StationeryApp(ft.Container):
                 self.snack(f"Insufficient stock: {ci['name']}", ft.Colors.RED_700)
                 return
 
-        cur.execute(
-            """INSERT INTO sales (customer_id,subtotal,discount,tax,total,payment_method,user_id)
-               VALUES (?,?,?,?,?,?,?)""",
-            (customer_id, subtotal, discount, tax, total, payment, self.user_id),
-        )
-        sale_id = cur.lastrowid
-        for ci in self.cart_items:
+        try:
             cur.execute(
-                "INSERT INTO sale_items (sale_id,item_id,quantity,price_at_sale,total) VALUES (?,?,?,?,?)",
-                (sale_id, ci["item_id"], ci["qty"], ci["price"], ci["subtotal"]),
+                """INSERT INTO sales (customer_id,subtotal,discount,tax,total,payment_method,user_id)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (customer_id, subtotal, discount, tax, total, payment, self.user_id),
             )
-            cur.execute("UPDATE items SET quantity=quantity-? WHERE id=?",
-                        (ci["qty"], ci["item_id"]))
-        if customer_id:
-            cur.execute(
-                "UPDATE customers SET loyalty_points=loyalty_points+?, total_spent=total_spent+? WHERE id=?",
-                (int(total), total, customer_id),
-            )
-        conn.commit()
-        log_audit(self.user_id, "SALE", f"Sale #{sale_id} — {sym}{total:.2f}")
-        conn.close()
-
-        self.snack(f"Sale #{sale_id} completed — {sym}{total:.2f}")
-        self.clear_cart()
+            sale_id = cur.lastrowid
+            for ci in self.cart_items:
+                cur.execute(
+                    "INSERT INTO sale_items (sale_id,item_id,quantity,price_at_sale,total) VALUES (?,?,?,?,?)",
+                    (sale_id, ci["item_id"], ci["qty"], ci["price"], ci["subtotal"]),
+                )
+                cur.execute("UPDATE items SET quantity=quantity-? WHERE id=?",
+                            (ci["qty"], ci["item_id"]))
+            if customer_id:
+                cur.execute(
+                    "UPDATE customers SET loyalty_points=loyalty_points+?, total_spent=total_spent+? WHERE id=?",
+                    (int(total), total, customer_id),
+                )
+            conn.commit()
+            log_audit(self.user_id, "SALE", f"Sale #{sale_id} — {sym}{total:.2f}")
+            self.snack(f"Sale #{sale_id} completed — {sym}{total:.2f}")
+            self.clear_cart()
+        except Exception as ex:
+            self.snack(f"Sale failed: {ex}", ft.Colors.RED_700)
+        finally:
+            conn.close()
         self.page.update()
 
     def clear_cart_handler(self, e):
@@ -1010,9 +1103,9 @@ class StationeryApp(ft.Container):
         c = conn.cursor()
         c.execute(
             """SELECT id,name,price,quantity FROM items
-               WHERE (name LIKE ? OR barcode LIKE ?) AND quantity>0
+               WHERE name LIKE ? AND quantity>0
                ORDER BY name LIMIT 10""",
-            (f"%{query}%", f"%{query}%"),
+            (f"%{query}%",),
         )
         rows = c.fetchall()
         conn.close()
@@ -1088,7 +1181,7 @@ class StationeryApp(ft.Container):
                                   data=item,
                                   on_click=self.on_cart_remove_item),
                 ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                padding=ft.padding.symmetric(horizontal=8, vertical=6),
+                padding=ft.Padding.symmetric(horizontal=8, vertical=6),
                 border=ft.Border.all(1, ft.Colors.GREY_200),
                 border_radius=8,
             )
@@ -1131,6 +1224,7 @@ class StationeryApp(ft.Container):
         self.cart_total_text.value = f"{sym}{total:.2f}"
         self.safe_update()
 
+    # REPORTS
     def reports_view(self):
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -1216,7 +1310,10 @@ class StationeryApp(ft.Container):
             ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.START),
         ], spacing=18, scroll=ft.ScrollMode.AUTO)
 
+    # sUPPLIERS (admin only)
     def suppliers_view(self):
+        if self.role != "admin":
+            return ft.Column([ft.Text("Access denied", size=20, color=ft.Colors.RED_700)])
         self.supplier_table = ft.DataTable(
             columns=[ft.DataColumn(ft.Text(h))
                      for h in ("Name", "Contact", "Phone", "Email", "Address", "Actions")],
@@ -1374,7 +1471,11 @@ class StationeryApp(ft.Container):
         dialog.open = True
         self.page.update()
 
+
+
     def customers_view(self):
+        if self.role != "admin":
+            return ft.Column([ft.Text("Access denied", size=20, color=ft.Colors.RED_700)])
         self.customer_table = ft.DataTable(
             columns=[ft.DataColumn(ft.Text(h))
                      for h in ("Name", "Phone", "Email", "Points", "Spent", "Since", "Actions")],
@@ -1420,7 +1521,7 @@ class StationeryApp(ft.Container):
                 ft.DataCell(ft.Container(
                     ft.Text(str(pts), color=ft.Colors.WHITE, size=12),
                     bgcolor=ft.Colors.AMBER_700, border_radius=10,
-                    padding=ft.padding.symmetric(horizontal=7, vertical=2),
+                    padding=ft.Padding.symmetric(horizontal=7, vertical=2),
                 )),
                 ft.DataCell(ft.Text(f"{sym}{spent:,.2f}", color=ft.Colors.GREEN_700)),
                 ft.DataCell(ft.Text((joined or "")[:10], size=12, color=ft.Colors.GREY_600)),
@@ -1534,7 +1635,193 @@ class StationeryApp(ft.Container):
         dialog.open = True
         self.page.update()
 
+
+
+    def users_view(self):
+        if self.role != "admin":
+            return ft.Column([ft.Text("Access denied", size=20, color=ft.Colors.RED_700)])
+        self.user_table = ft.DataTable(
+            columns=[ft.DataColumn(ft.Text(h)) for h in ("Username", "Full Name", "Role", "Created", "Actions")],
+            border=ft.Border.all(1, ft.Colors.GREY_300),
+            border_radius=8, data_row_max_height=52,
+        )
+        self.refresh_users()
+        return ft.Column([
+            ft.Text("User Management", size=26, weight=ft.FontWeight.BOLD),
+            ft.Row([
+                ft.Button("+ Add User", icon=ft.Icons.PERSON_ADD,
+                          style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
+                          on_click=self.add_user_dialog_handler),
+            ]),
+            ft.Container(
+                content=ft.Column([self.user_table], scroll=ft.ScrollMode.AUTO),
+                expand=True,
+                border=ft.Border.all(1, ft.Colors.GREY_200), border_radius=10,
+            ),
+        ], expand=True, spacing=14)
+
+    def add_user_dialog_handler(self, e):
+        self.add_user_dialog()
+
+    def refresh_users(self, e=None):
+        if not hasattr(self, "user_table"):
+            return
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, username, full_name, role, created_at FROM users ORDER BY username")
+        rows = c.fetchall()
+        conn.close()
+        self.user_table.rows.clear()
+        for uid, uname, full_name, role, created in rows:
+            edit_btn = ft.IconButton(ft.Icons.EDIT, data=uid, on_click=self.on_edit_user_click)
+            delete_btn = ft.IconButton(ft.Icons.DELETE, icon_color=ft.Colors.RED_400,
+                                       data=uid, on_click=self.on_delete_user_click)
+            self.user_table.rows.append(ft.DataRow(cells=[
+                ft.DataCell(ft.Text(uname, weight=ft.FontWeight.W_500)),
+                ft.DataCell(ft.Text(full_name or "—")),
+                ft.DataCell(ft.Container(
+                    ft.Text(role.upper(), size=11, color=ft.Colors.WHITE),
+                    bgcolor=ft.Colors.BLUE_700 if role == "admin" else ft.Colors.GREEN_700,
+                    border_radius=6,
+                    padding=ft.Padding.symmetric(horizontal=7, vertical=2),
+                )),
+                ft.DataCell(ft.Text((created or "")[:10], size=12, color=ft.Colors.GREY_600)),
+                ft.DataCell(ft.Row([edit_btn, delete_btn], tight=True)),
+            ]))
+        self.safe_update()
+
+    def on_edit_user_click(self, e):
+        uid = e.control.data
+        self.edit_user_dialog(uid)
+
+    def on_delete_user_click(self, e):
+        uid = e.control.data
+        self.delete_user(uid)
+
+    def _user_dialog(self, title, data=None, on_save=None):
+        f = {
+            "username": ft.TextField(label="Username *", expand=True, value=data[1] if data else ""),
+            "full_name": ft.TextField(label="Full Name", expand=True, value=data[2] if data else ""),
+            "role": ft.Dropdown(
+                label="Role *", expand=True, value=data[3] if data else "seller",
+                options=[ft.dropdown.Option("admin", "Administrator"), ft.dropdown.Option("seller", "Seller")]
+            ),
+            "password": ft.TextField(label="Password (leave blank to keep unchanged)", password=True,
+                                     can_reveal_password=True, expand=True),
+        }
+        content = ft.Column([
+            ft.Row([f["username"], f["full_name"]], spacing=12),
+            ft.Row([f["role"], f["password"]], spacing=12),
+        ], spacing=12, width=500, height=150)
+
+        def save(_e):
+            if not (f["username"].value or "").strip():
+                f["username"].error_text = "Required"; f["username"].update(); return
+            if not f["role"].value:
+                f["role"].error_text = "Required"; f["role"].update(); return
+            on_save(f, dialog)
+
+        dialog = ft.AlertDialog(
+            title=ft.Text(title, size=18, weight=ft.FontWeight.BOLD),
+            content=content,
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: self.close_dialog(dialog)),
+                ft.Button("Save", on_click=save,
+                          style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE)),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.overlay.append(dialog)
+        dialog.open = True
+        self.page.update()
+
+    def add_user_dialog(self):
+        def on_save(f, dialog):
+            pwd = f["password"].value
+            if not pwd:
+                self.snack("Password required for new user", ft.Colors.RED_700)
+                return
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("INSERT INTO users (username, password_hash, role, full_name) VALUES (?,?,?,?)",
+                          (f["username"].value.strip(), hash_password(pwd), f["role"].value, f["full_name"].value))
+                conn.commit()
+                conn.close()
+                self.close_dialog(dialog)
+                self.refresh_users()
+                self.snack("User added")
+            except sqlite3.IntegrityError:
+                self.snack("Username already exists", ft.Colors.RED_700)
+            except Exception as ex:
+                self.snack(f"Failed: {ex}", ft.Colors.RED_700)
+        self._user_dialog("Add User", on_save=on_save)
+
+    def edit_user_dialog(self, uid):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, username, full_name, role FROM users WHERE id=?", (uid,))
+        data = c.fetchone()
+        conn.close()
+        if not data:
+            return
+
+        def on_save(f, dialog):
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                if f["password"].value:
+                    c.execute("UPDATE users SET username=?, full_name=?, role=?, password_hash=? WHERE id=?",
+                              (f["username"].value.strip(), f["full_name"].value, f["role"].value,
+                               hash_password(f["password"].value), uid))
+                else:
+                    c.execute("UPDATE users SET username=?, full_name=?, role=? WHERE id=?",
+                              (f["username"].value.strip(), f["full_name"].value, f["role"].value, uid))
+                conn.commit()
+                conn.close()
+                self.close_dialog(dialog)
+                self.refresh_users()
+                self.snack("User updated")
+            except sqlite3.IntegrityError:
+                self.snack("Username already exists", ft.Colors.RED_700)
+            except Exception as ex:
+                self.snack(f"Failed: {ex}", ft.Colors.RED_700)
+        self._user_dialog(f"Edit — {data[1]}", data=data, on_save=on_save)
+
+    def delete_user(self, uid):
+        if uid == self.user_id:
+            self.snack("Cannot delete yourself", ft.Colors.RED_700)
+            return
+        def confirm(_e):
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("DELETE FROM users WHERE id=?", (uid,))
+                conn.commit()
+                conn.close()
+                self.close_dialog(dialog)
+                self.refresh_users()
+                self.snack("User deleted", ft.Colors.RED_700)
+            except Exception as ex:
+                self.snack(f"Failed: {ex}", ft.Colors.RED_700)
+        dialog = ft.AlertDialog(
+            title=ft.Text("Delete User"),
+            content=ft.Text("Permanently delete this user?"),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: self.close_dialog(dialog)),
+                ft.Button("Delete", on_click=confirm,
+                          style=ft.ButtonStyle(bgcolor=ft.Colors.RED_700, color=ft.Colors.WHITE)),
+            ],
+        )
+        self.page.overlay.append(dialog)
+        dialog.open = True
+        self.page.update()
+
+
+
     def settings_view(self):
+        if self.role != "admin":
+            return ft.Column([ft.Text("Access denied", size=20, color=ft.Colors.RED_700)])
         store_f = ft.TextField(label="Store Name",
                                value=get_setting("store_name", "Uptown Stationery"), width=280)
         tax_f   = ft.TextField(label="Default Tax Rate (%)",
@@ -1715,23 +2002,43 @@ class StationeryApp(ft.Container):
 
 
 def main(page: ft.Page):
-    page.title        = f"{get_setting('store_name', 'Uptown Stationery')} — Manager"
-    page.theme_mode   = (ft.ThemeMode.DARK
-                         if get_setting("dark_mode", "false") == "true"
-                         else ft.ThemeMode.LIGHT)
-    page.padding      = 0
-    page.spacing      = 0
-    page.window_width      = 1300
-    page.window_height     = 840
-    page.window_min_width  = 960
-    page.window_min_height = 660
+    page.title = f"{get_setting('store_name', 'Uptown Stationery')} — Manager"
+    page.theme_mode = (
+        ft.ThemeMode.DARK if get_setting("dark_mode", "false") == "true" else ft.ThemeMode.LIGHT
+    )
+    page.padding = 0
+    page.spacing = 0
 
-    page.add(LoginPage(lambda uid, uname, role: (
-        page.clean(),
-        page.add(StationeryApp(uid, uname, role)),
-        page.update(),
-    )))
+    # Fixed size
+    WIDTH, HEIGHT = 1300, 840
+
+    page.window_width = WIDTH
+    page.window_height = HEIGHT
+    page.window_min_width = WIDTH
+    page.window_max_width = WIDTH
+    page.window_min_height = HEIGHT
+    page.window_max_height = HEIGHT
+
+    # Try to disable resizing (may be ignored)
+    try:
+        page.window_resizable = False
+    except AttributeError:
+        try:
+            page.resizable = False
+        except AttributeError:
+            pass
+
     page.update()
 
+    page.add(
+        LoginPage(
+            lambda uid, uname, role: (
+                page.clean(),
+                page.add(StationeryApp(uid, uname, role)),
+                page.update(),
+            )
+        )
+    )
+    page.update()
 
-ft.app(target=main)
+ft.run(main)
