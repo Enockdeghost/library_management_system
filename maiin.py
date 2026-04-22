@@ -4,11 +4,99 @@ import hashlib
 import csv
 import os
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import partial
 
 DB_FILE = "stationery.db"
 BACKUP_DIR = "backups"
+
+
+
+class CustomTitleBar(ft.Container):
+    def __init__(self, page: ft.Page, title: str):
+        super().__init__()
+        self._page = page
+        self.title = title
+        self.is_maximized = False
+
+        self.normal_width = 1300
+        self.normal_height = 840
+        self.normal_left = 100
+        self.normal_top = 50
+
+        self.content = ft.Row(
+            [
+                ft.WindowDragArea(
+                    ft.Container(
+                        content=ft.Row([
+                            ft.Icon(ft.Icons.STORE, color=ft.Colors.WHITE, size=20),
+                            ft.Text(self.title, color=ft.Colors.WHITE, size=14, weight=ft.FontWeight.W_500),
+                        ], spacing=8),
+                        padding=ft.Padding.only(left=15, top=10),
+                        height=40,
+                        expand=True,
+                    )
+                ),
+                ft.Row([
+                    ft.IconButton(
+                        ft.Icons.MINIMIZE,
+                        icon_color=ft.Colors.WHITE,
+                        icon_size=18,
+                        on_click=self.minimize_window,
+                        tooltip="Minimize",
+                    ),
+                    ft.IconButton(
+                        ft.Icons.CROP_SQUARE,
+                        icon_color=ft.Colors.WHITE,
+                        icon_size=18,
+                        on_click=self.maximize_restore_window,
+                        tooltip="Maximize",
+                    ),
+                    ft.IconButton(
+                        ft.Icons.CLOSE,
+                        icon_color=ft.Colors.WHITE,
+                        icon_size=18,
+                        on_click=self.close_window,
+                        tooltip="Close",
+                    ),
+                ], spacing=0),
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        )
+        self.bgcolor = ft.Colors.BLUE_700
+        self.height = 40
+        self.padding = ft.Padding.only(right=5)
+
+    def minimize_window(self, e):
+        self._page.window_minimized = True
+        self._page.update()
+
+    def maximize_restore_window(self, e):
+        if self.is_maximized:
+            self._page.window_width = self.normal_width
+            self._page.window_height = self.normal_height
+            self._page.window_left = self.normal_left
+            self._page.window_top = self.normal_top
+            self.is_maximized = False
+            e.control.icon = ft.Icons.CROP_SQUARE
+            e.control.tooltip = "Maximize"
+        else:
+            self.normal_width = self._page.window_width
+            self.normal_height = self._page.window_height
+            self.normal_left = self._page.window_left or 100
+            self.normal_top = self._page.window_top or 50
+            self._page.window_width = 1920
+            self._page.window_height = 1080
+            self._page.window_left = 0
+            self._page.window_top = 0
+            self.is_maximized = True
+            e.control.icon = ft.Icons.FILTER_NONE
+            e.control.tooltip = "Restore"
+        self._page.update()
+
+    def close_window(self, e):
+        self._page.window_close()
+
 
 
 def init_db():
@@ -81,6 +169,30 @@ def init_db():
         FOREIGN KEY (item_id) REFERENCES items(id)
     )''')
 
+    c.execute('''CREATE TABLE IF NOT EXISTS purchase_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        supplier_id INTEGER NOT NULL,
+        order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expected_date DATE,
+        status TEXT DEFAULT 'pending',
+        total_cost REAL DEFAULT 0.0,
+        created_by INTEGER,
+        notes TEXT,
+        FOREIGN KEY (supplier_id) REFERENCES suppliers(id),
+        FOREIGN KEY (created_by) REFERENCES users(id)
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS po_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        po_id INTEGER NOT NULL,
+        item_id INTEGER NOT NULL,
+        quantity_ordered INTEGER NOT NULL,
+        quantity_received INTEGER DEFAULT 0,
+        cost_price REAL NOT NULL,
+        FOREIGN KEY (po_id) REFERENCES purchase_orders(id),
+        FOREIGN KEY (item_id) REFERENCES items(id)
+    )''')
+
     c.execute('''CREATE TABLE IF NOT EXISTS audit_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -119,6 +231,7 @@ def init_db():
 
 
 init_db()
+
 
 
 def hash_password(pwd: str) -> str:
@@ -244,6 +357,7 @@ class LoginPage(ft.Container):
             self.update()
 
 
+
 class StationeryApp(ft.Container):
     def __init__(self, user_id: int, username: str, role: str):
         super().__init__(expand=True)
@@ -270,6 +384,7 @@ class StationeryApp(ft.Container):
         if is_admin:
             destinations.extend([
                 ft.NavigationRailDestination(icon=ft.Icons.LOCAL_SHIPPING, label="Suppliers"),
+                ft.NavigationRailDestination(icon=ft.Icons.SHOPPING_CART,  label="Purchasing"),
                 ft.NavigationRailDestination(icon=ft.Icons.GROUP,          label="Customers"),
                 ft.NavigationRailDestination(icon=ft.Icons.PEOPLE,         label="Users"),
                 ft.NavigationRailDestination(icon=ft.Icons.SETTINGS,       label="Settings"),
@@ -361,9 +476,10 @@ class StationeryApp(ft.Container):
                 2: self.sales_view,
                 3: self.reports_view,
                 4: self.suppliers_view,
-                5: self.customers_view,
-                6: self.users_view,
-                7: self.settings_view,
+                5: self.purchasing_view,
+                6: self.customers_view,
+                7: self.users_view,
+                8: self.settings_view,
             }.get(idx, lambda: ft.Text("Not implemented"))
         else:
             fn = {
@@ -375,7 +491,7 @@ class StationeryApp(ft.Container):
         self.content_area.content = fn()
         self.safe_update()
 
-    # DASHBOARD
+
     def dashboard_view(self):
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -414,12 +530,15 @@ class StationeryApp(ft.Container):
         """)
         recent_sales = c.fetchall()
 
+        # Reorder suggestions (low stock + suggested order qty)
         c.execute("""
-            SELECT name, quantity, low_stock_threshold FROM items
+            SELECT id, name, quantity, low_stock_threshold, supplier_id
+            FROM items
             WHERE quantity <= low_stock_threshold
-            ORDER BY quantity ASC LIMIT 6
+            ORDER BY (low_stock_threshold * 2 - quantity) DESC
+            LIMIT 8
         """)
-        low_items = c.fetchall()
+        reorder_items = c.fetchall()
         conn.close()
 
         sym = currency_symbol()
@@ -477,35 +596,57 @@ class StationeryApp(ft.Container):
             ]) for name, qty, rev in top_prods
         ]
 
-        empty5 = [ft.DataRow(cells=[ft.DataCell(ft.Text("—"))] * 5)]
-        recent_rows = [
-            ft.DataRow(cells=[
-                ft.DataCell(ft.Text(f"#{sid}", weight=ft.FontWeight.W_500)),
-                ft.DataCell(ft.Text((sdate or "")[:16], size=12)),
-                ft.DataCell(ft.Text(cname)),
-                ft.DataCell(ft.Text(f"{sym}{tot:.2f}", color=ft.Colors.GREEN_700,
-                                    weight=ft.FontWeight.W_600)),
-                ft.DataCell(ft.Container(
-                    ft.Text(pay or "Cash", size=11, color=ft.Colors.WHITE),
-                    bgcolor=ft.Colors.BLUE_700, border_radius=6,
-                    padding=ft.Padding.symmetric(horizontal=7, vertical=2),
-                )),
-            ])
-            for sid, sdate, cname, tot, pay in recent_sales
-        ] or empty5
+        # Recent sales with drill-down
+        recent_rows = []
+        for sid, sdate, cname, tot, pay in recent_sales:
+            row = ft.DataRow(
+                cells=[
+                    ft.DataCell(ft.TextButton(f"#{sid}", on_click=lambda e, sale_id=sid: self.show_sale_details(sale_id))),
+                    ft.DataCell(ft.Text((sdate or "")[:16], size=12)),
+                    ft.DataCell(ft.Text(cname)),
+                    ft.DataCell(ft.Text(f"{sym}{tot:.2f}", color=ft.Colors.GREEN_700,
+                                        weight=ft.FontWeight.W_600)),
+                    ft.DataCell(ft.Container(
+                        ft.Text(pay or "Cash", size=11, color=ft.Colors.WHITE),
+                        bgcolor=ft.Colors.BLUE_700, border_radius=6,
+                        padding=ft.Padding.symmetric(horizontal=7, vertical=2),
+                    )),
+                ]
+            )
+            recent_rows.append(row)
 
-        low_rows = [
-            ft.DataRow(cells=[
-                ft.DataCell(ft.Text(name, weight=ft.FontWeight.W_500)),
-                ft.DataCell(ft.Text(str(qty), color=ft.Colors.RED_700,
-                                    weight=ft.FontWeight.BOLD)),
-                ft.DataCell(ft.Text(str(thr), color=ft.Colors.GREY_600)),
-            ])
-            for name, qty, thr in low_items
-        ] or [ft.DataRow(cells=[
-            ft.DataCell(ft.Text("All stock levels OK ✓", color=ft.Colors.GREEN_700)),
-            ft.DataCell(ft.Text("")), ft.DataCell(ft.Text("")),
-        ])]
+        if not recent_rows:
+            recent_rows = [ft.DataRow(cells=[ft.DataCell(ft.Text("—"))] * 5)]
+
+        # Reorder suggestions with "Create PO" button
+        reorder_rows = []
+        for iid, name, qty, threshold, sup_id in reorder_items:
+            suggest_qty = max(threshold * 2 - qty, 1)
+            create_btn = ft.IconButton(
+                ft.Icons.ADD_SHOPPING_CART,
+                tooltip="Create PO for this item",
+                data={"id": iid, "name": name, "qty": suggest_qty, "sup_id": sup_id},
+                on_click=self.create_po_from_suggestion
+            )
+            reorder_rows.append(ft.DataRow(cells=[
+                ft.DataCell(ft.Text(name)),
+                ft.DataCell(ft.Text(str(qty), color=ft.Colors.RED_700, weight=ft.FontWeight.BOLD)),
+                ft.DataCell(ft.Text(str(threshold))),
+                ft.DataCell(ft.Text(str(suggest_qty), color=ft.Colors.BLUE_700, weight=ft.FontWeight.W_500)),
+                ft.DataCell(create_btn),
+            ]))
+
+        reorder_table = ft.DataTable(
+            columns=[
+                ft.DataColumn(ft.Text("Item")),
+                ft.DataColumn(ft.Text("Stock")),
+                ft.DataColumn(ft.Text("Min")),
+                ft.DataColumn(ft.Text("Suggest")),
+                ft.DataColumn(ft.Text("Action")),
+            ],
+            rows=reorder_rows or [ft.DataRow(cells=[ft.DataCell(ft.Text("All stock OK ✓"))] * 5)],
+            data_row_max_height=40,
+        )
 
         return ft.Column([
             ft.Text("Dashboard", size=28, weight=ft.FontWeight.BOLD),
@@ -522,7 +663,7 @@ class StationeryApp(ft.Container):
             ft.Row([
                 ft.Card(
                     content=ft.Container(ft.Column([
-                        ft.Text("Recent Sales", size=15, weight=ft.FontWeight.W_600),
+                        ft.Text("Recent Sales (click ID for details)", size=15, weight=ft.FontWeight.W_600),
                         ft.Divider(height=6),
                         ft.DataTable(
                             columns=[ft.DataColumn(ft.Text(h))
@@ -537,22 +678,90 @@ class StationeryApp(ft.Container):
                     content=ft.Container(ft.Column([
                         ft.Row([
                             ft.Icon(ft.Icons.WARNING_AMBER, color=ft.Colors.ORANGE_700, size=18),
-                            ft.Text("Low Stock", size=15, weight=ft.FontWeight.W_600,
+                            ft.Text("Reorder Suggestions", size=15, weight=ft.FontWeight.W_600,
                                     color=ft.Colors.ORANGE_700),
-                        ], spacing=6),
+                        ]),
                         ft.Divider(height=6),
-                        ft.DataTable(
-                            columns=[ft.DataColumn(ft.Text(h)) for h in ("Item", "Qty", "Min")],
-                            rows=low_rows,
-                            data_row_max_height=40,
-                        ),
+                        reorder_table,
+                        ft.Button("Create PO from all suggestions", icon=ft.Icons.SHOPPING_CART,
+                                  on_click=self.create_po_from_all_suggestions),
                     ], spacing=6), padding=14),
-                    elevation=2, width=340,
+                    elevation=2, width=500,
                 ),
             ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.START),
         ], spacing=18, scroll=ft.ScrollMode.AUTO)
 
-    # INVENTORY
+    def show_sale_details(self, sale_id):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""
+            SELECT i.name, si.quantity, si.price_at_sale, si.total
+            FROM sale_items si JOIN items i ON si.item_id = i.id
+            WHERE si.sale_id = ?
+        """, (sale_id,))
+        items = c.fetchall()
+        c.execute("SELECT total, payment_method, sale_date FROM sales WHERE id=?", (sale_id,))
+        sale_info = c.fetchone()
+        conn.close()
+
+        if not sale_info:
+            return
+
+        sym = currency_symbol()
+        content = ft.Column([
+            ft.Text(f"Sale #{sale_id} — {sale_info[2][:16]}", weight=ft.FontWeight.BOLD),
+            ft.Text(f"Total: {sym}{sale_info[0]:.2f} | Payment: {sale_info[1]}"),
+            ft.Divider(),
+            ft.DataTable(
+                columns=[
+                    ft.DataColumn(ft.Text("Item")),
+                    ft.DataColumn(ft.Text("Qty")),
+                    ft.DataColumn(ft.Text("Price")),
+                    ft.DataColumn(ft.Text("Total")),
+                ],
+                rows=[
+                    ft.DataRow(cells=[
+                        ft.DataCell(ft.Text(name)),
+                        ft.DataCell(ft.Text(str(qty))),
+                        ft.DataCell(ft.Text(f"{sym}{price:.2f}")),
+                        ft.DataCell(ft.Text(f"{sym}{tot:.2f}")),
+                    ]) for name, qty, price, tot in items
+                ],
+                data_row_max_height=40,
+            )
+        ], spacing=10, width=500, height=350, scroll=ft.ScrollMode.AUTO)
+
+        dialog = ft.AlertDialog(
+            title=ft.Text("Sale Details"),
+            content=content,
+            actions=[ft.TextButton("Close", on_click=lambda _: self.close_dialog(dialog))],
+        )
+        self.page.overlay.append(dialog)
+        dialog.open = True
+        self.page.update()
+
+    def create_po_from_suggestion(self, e):
+        data = e.control.data
+        self.open_purchase_order_dialog(prefill=[data])
+
+    def create_po_from_all_suggestions(self, e):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, name, quantity, low_stock_threshold, supplier_id
+            FROM items
+            WHERE quantity <= low_stock_threshold
+        """)
+        items = c.fetchall()
+        conn.close()
+
+        prefilled = []
+        for iid, name, qty, threshold, sup_id in items:
+            suggest_qty = max(threshold * 2 - qty, 1)
+            prefilled.append({"id": iid, "name": name, "qty": suggest_qty, "sup_id": sup_id})
+        self.open_purchase_order_dialog(prefill=prefilled)
+
+
     def inventory_view(self):
         self.inv_search = ft.TextField(
             hint_text="Search by name…",
@@ -889,7 +1098,7 @@ class StationeryApp(ft.Container):
         except Exception as ex:
             self.snack(f"Export failed: {ex}", ft.Colors.RED_700)
 
-    # SALES / POS
+
     def sales_view(self):
         self.cart_items = []
 
@@ -1221,53 +1430,92 @@ class StationeryApp(ft.Container):
         self.cart_total_text.value = f"{sym}{total:.2f}"
         self.safe_update()
 
-    # REPORTS
     def reports_view(self):
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
 
+        # P&L Summary (revenue - COGS)
+        c.execute("SELECT COALESCE(SUM(total),0) FROM sales")
+        total_revenue = c.fetchone()[0]
+        c.execute("""
+            SELECT COALESCE(SUM(si.quantity * i.cost_price),0)
+            FROM sale_items si JOIN items i ON si.item_id = i.id
+        """)
+        total_cogs = c.fetchone()[0]
+        gross_profit = total_revenue - total_cogs
+        sym = currency_symbol()
+        pl_card = ft.Card(
+            content=ft.Container(
+                ft.Column([
+                    ft.Text("Profit & Loss Summary", size=16, weight=ft.FontWeight.W_600),
+                    ft.Divider(),
+                    ft.Row([ft.Text("Total Revenue:"), ft.Text(f"{sym}{total_revenue:,.2f}")], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                    ft.Row([ft.Text("Cost of Goods Sold:"), ft.Text(f"{sym}{total_cogs:,.2f}")], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                    ft.Row([ft.Text("Gross Profit:"), ft.Text(f"{sym}{gross_profit:,.2f}", color=ft.Colors.GREEN_700 if gross_profit>=0 else ft.Colors.RED_700, weight=ft.FontWeight.BOLD)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                ]),
+                padding=18,
+            ),
+            elevation=2,
+            expand=True,
+        )
+
+        # Staff performance
+        months = []
+        for i in range(6):
+            d = datetime.now().replace(day=1) - timedelta(days=30*i)
+            months.append((d.strftime("%Y-%m"), d.strftime("%B %Y")))
+        month_options = [ft.dropdown.Option(m[0], m[1]) for m in months]
+        selected_month = ft.Dropdown(
+            label="Month", width=200, value=months[0][0] if months else None,
+            options=month_options
+        )
+        staff_table = ft.DataTable(
+            columns=[
+                ft.DataColumn(ft.Text("Staff")),
+                ft.DataColumn(ft.Text("Sales Count")),
+                ft.DataColumn(ft.Text("Total Revenue")),
+            ],
+            border=ft.Border.all(1, ft.Colors.GREY_300),
+            border_radius=8,
+        )
+
+        def update_staff_report(e):
+            month = selected_month.value
+            if not month:
+                return
+            c.execute("""
+                SELECT u.username, COUNT(s.id), COALESCE(SUM(s.total),0)
+                FROM sales s JOIN users u ON s.user_id = u.id
+                WHERE strftime('%Y-%m', s.sale_date) = ?
+                GROUP BY u.id
+                ORDER BY SUM(s.total) DESC
+            """, (month,))
+            rows = c.fetchall()
+            staff_table.rows = [
+                ft.DataRow(cells=[
+                    ft.DataCell(ft.Text(uname)),
+                    ft.DataCell(ft.Text(str(cnt))),
+                    ft.DataCell(ft.Text(f"{sym}{rev:,.2f}", color=ft.Colors.GREEN_700)),
+                ]) for uname, cnt, rev in rows
+            ] or [ft.DataRow(cells=[ft.DataCell(ft.Text("No sales this month"))] * 3)]
+            self.page.update()
+
+        selected_month.on_change = update_staff_report
+
+        # Daily sales table
         c.execute("""
             SELECT DATE(sale_date), COUNT(*), COALESCE(SUM(total),0)
             FROM sales WHERE sale_date >= DATE('now','-6 days')
             GROUP BY DATE(sale_date) ORDER BY 1
         """)
         daily = c.fetchall()
-
         c.execute("""
             SELECT i.name, COALESCE(SUM(si.quantity),0), COALESCE(SUM(si.total),0)
             FROM sale_items si JOIN items i ON si.item_id=i.id
             GROUP BY si.item_id ORDER BY SUM(si.total) DESC LIMIT 10
         """)
         top_products = c.fetchall()
-
-        c.execute("""
-            SELECT strftime('%Y-%m',sale_date), COUNT(*),
-                   COALESCE(SUM(total),0), COALESCE(SUM(discount),0)
-            FROM sales GROUP BY 1 ORDER BY 1 DESC LIMIT 6
-        """)
-        monthly = c.fetchall()
-
-        c.execute("SELECT payment_method, COUNT(*), COALESCE(SUM(total),0) FROM sales GROUP BY 1")
-        payments = c.fetchall()
         conn.close()
-
-        sym = currency_symbol()
-
-        def tbl_card(title, headers, rows):
-            empty = [ft.DataRow(cells=[ft.DataCell(ft.Text("No data yet"))] +
-                                [ft.DataCell(ft.Text(""))] * (len(headers) - 1))]
-            return ft.Card(
-                content=ft.Container(ft.Column([
-                    ft.Text(title, size=15, weight=ft.FontWeight.W_600),
-                    ft.Divider(height=6),
-                    ft.DataTable(
-                        columns=[ft.DataColumn(ft.Text(h)) for h in headers],
-                        rows=rows or empty,
-                        data_row_max_height=40,
-                    ),
-                ], spacing=6), padding=14),
-                elevation=2,
-            )
 
         daily_rows = [ft.DataRow(cells=[
             ft.DataCell(ft.Text(d or "—")),
@@ -1282,32 +1530,325 @@ class StationeryApp(ft.Container):
                                 weight=ft.FontWeight.W_600)),
         ]) for name, qty, rev in top_products]
 
-        monthly_rows = [ft.DataRow(cells=[
-            ft.DataCell(ft.Text(m)),
-            ft.DataCell(ft.Text(str(cnt))),
-            ft.DataCell(ft.Text(f"{sym}{rev:,.2f}", color=ft.Colors.GREEN_700)),
-            ft.DataCell(ft.Text(f"{sym}{disc:,.2f}", color=ft.Colors.ORANGE_700)),
-        ]) for m, cnt, rev, disc in monthly]
+        return ft.Column([
+            ft.Text("Reports & Analytics", size=26, weight=ft.FontWeight.BOLD),
+            pl_card,
+            ft.Row([
+                ft.Card(
+                    content=ft.Container(
+                        ft.Column([
+                            ft.Text("Staff Performance", size=15, weight=ft.FontWeight.W_600),
+                            selected_month,
+                            staff_table,
+                        ]),
+                        padding=14
+                    ),
+                    elevation=2, expand=True
+                ),
+                ft.Card(
+                    content=ft.Container(ft.Column([
+                        ft.Text("Sales — Last 7 Days", size=15, weight=ft.FontWeight.W_600),
+                        ft.DataTable(
+                            columns=[ft.DataColumn(ft.Text(h)) for h in ("Date", "Orders", "Revenue")],
+                            rows=daily_rows or [ft.DataRow(cells=[ft.DataCell(ft.Text("No data"))] * 3)],
+                        ),
+                    ]), padding=14),
+                    elevation=2, expand=True
+                ),
+            ], spacing=14),
+            ft.Card(
+                content=ft.Container(ft.Column([
+                    ft.Text("Top Products", size=15, weight=ft.FontWeight.W_600),
+                    ft.DataTable(
+                        columns=[ft.DataColumn(ft.Text(h)) for h in ("Product", "Qty Sold", "Revenue")],
+                        rows=top_rows or [ft.DataRow(cells=[ft.DataCell(ft.Text("No data"))] * 3)],
+                    ),
+                ]), padding=14),
+                elevation=2
+            ),
+        ], spacing=14, scroll=ft.ScrollMode.AUTO)
 
-        pay_rows = [ft.DataRow(cells=[
-            ft.DataCell(ft.Text(pm or "Cash")),
-            ft.DataCell(ft.Text(str(cnt))),
-            ft.DataCell(ft.Text(f"{sym}{rev:,.2f}")),
-        ]) for pm, cnt, rev in payments]
+        update_staff_report(None)  # initial load
+
+    def purchasing_view(self):
+        if self.role != "admin":
+            return ft.Column([ft.Text("Access denied", size=20, color=ft.Colors.RED_700)])
+
+        self.po_table = ft.DataTable(
+            columns=[
+                ft.DataColumn(ft.Text("PO #")),
+                ft.DataColumn(ft.Text("Supplier")),
+                ft.DataColumn(ft.Text("Order Date")),
+                ft.DataColumn(ft.Text("Expected")),
+                ft.DataColumn(ft.Text("Status")),
+                ft.DataColumn(ft.Text("Total Cost")),
+                ft.DataColumn(ft.Text("Actions")),
+            ],
+            border=ft.Border.all(1, ft.Colors.GREY_300),
+            border_radius=8,
+        )
+        self.refresh_po_list()
 
         return ft.Column([
-            ft.Text("Reports", size=26, weight=ft.FontWeight.BOLD),
+            ft.Text("Purchase Orders", size=26, weight=ft.FontWeight.BOLD),
             ft.Row([
-                tbl_card("Sales — Last 7 Days",    ("Date",    "Sales",    "Revenue"),              daily_rows),
-                tbl_card("Payment Breakdown",       ("Method",  "Count",    "Total"),                pay_rows),
-            ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.START),
-            ft.Row([
-                tbl_card("Top Products",            ("Product", "Qty Sold", "Revenue"),              top_rows),
-                tbl_card("Monthly Summary",         ("Month",   "Sales",    "Revenue", "Discount"),  monthly_rows),
-            ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.START),
-        ], spacing=18, scroll=ft.ScrollMode.AUTO)
+                ft.Button("+ New Purchase Order", icon=ft.Icons.ADD,
+                          style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
+                          on_click=lambda e: self.open_purchase_order_dialog()),
+                ft.Button("Refresh", icon=ft.Icons.REFRESH, on_click=self.refresh_po_list),
+            ]),
+            ft.Container(
+                content=ft.Column([self.po_table], scroll=ft.ScrollMode.AUTO),
+                expand=True,
+                border=ft.Border.all(1, ft.Colors.GREY_200), border_radius=10,
+            ),
+        ], expand=True, spacing=14)
 
-    # sUPPLIERS (admin only)
+    def refresh_po_list(self, e=None):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""
+            SELECT po.id, s.name, po.order_date, po.expected_date, po.status, po.total_cost
+            FROM purchase_orders po JOIN suppliers s ON po.supplier_id = s.id
+            ORDER BY po.order_date DESC
+        """)
+        rows = c.fetchall()
+        conn.close()
+        sym = currency_symbol()
+        self.po_table.rows = [
+            ft.DataRow(cells=[
+                ft.DataCell(ft.Text(str(pid))),
+                ft.DataCell(ft.Text(sname)),
+                ft.DataCell(ft.Text(odate[:10] if odate else "")),
+                ft.DataCell(ft.Text(edate if edate else "—")),
+                ft.DataCell(ft.Container(
+                    ft.Text(status.upper(), size=11, color=ft.Colors.WHITE),
+                    bgcolor={
+                        "pending": ft.Colors.ORANGE_700,
+                        "ordered": ft.Colors.BLUE_700,
+                        "received": ft.Colors.GREEN_700,
+                        "cancelled": ft.Colors.RED_700,
+                    }.get(status, ft.Colors.GREY_700),
+                    border_radius=6,
+                    padding=ft.Padding.symmetric(horizontal=7, vertical=2),
+                )),
+                ft.DataCell(ft.Text(f"{sym}{total:.2f}")),
+                ft.DataCell(ft.Row([
+                    ft.IconButton(ft.Icons.EDIT, data=pid, on_click=self.edit_po_dialog),
+                    ft.IconButton(ft.Icons.CHECK_CIRCLE, data=pid, on_click=self.receive_po_dialog,
+                                  tooltip="Receive Items"),
+                ], tight=True)),
+            ]) for pid, sname, odate, edate, status, total in rows
+        ]
+        self.safe_update()
+
+    def open_purchase_order_dialog(self, prefill=None):
+        if prefill is None:
+            prefill = []
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, name FROM suppliers ORDER BY name")
+        suppliers = c.fetchall()
+        conn.close()
+
+        supplier_dd = ft.Dropdown(
+            label="Supplier *", width=250,
+            options=[ft.dropdown.Option(str(s[0]), s[1]) for s in suppliers]
+        )
+        expected_date = ft.TextField(label="Expected Date (YYYY-MM-DD)", width=200)
+        notes = ft.TextField(label="Notes", multiline=True, min_lines=2, width=400)
+
+        # Items list with dynamic rows
+        items_container = ft.Column(spacing=8, width=600, height=250, scroll=ft.ScrollMode.AUTO)
+        items_data = []  # will hold dicts: item_id, name, qty, cost
+
+        def add_item_row(item_id=None, item_name=None, qty=1, cost=0.0):
+            item_dd = ft.Dropdown(
+                width=200, hint_text="Select Item",
+                options=[],
+            )
+            # Populate item dropdown asynchronously (but we'll preload)
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("SELECT id, name, cost_price FROM items ORDER BY name")
+            all_items = c.fetchall()
+            conn.close()
+            item_dd.options = [ft.dropdown.Option(str(it[0]), f"{it[1]} (cost: {sym}{it[2]:.2f})") for it in all_items]
+            if item_id:
+                item_dd.value = str(item_id)
+
+            qty_field = ft.TextField(value=str(qty), width=80, keyboard_type=ft.KeyboardType.NUMBER)
+            cost_field = ft.TextField(value=f"{cost:.2f}", width=100, keyboard_type=ft.KeyboardType.NUMBER,
+                                      prefix_text=sym)
+            remove_btn = ft.IconButton(ft.Icons.DELETE, icon_color=ft.Colors.RED_400)
+
+            row_data = {"id": item_id, "name": item_name, "qty": qty_field, "cost": cost_field}
+            items_data.append(row_data)
+
+            row = ft.Row([item_dd, qty_field, cost_field, remove_btn], spacing=8)
+            items_container.controls.append(row)
+
+            def remove_row(e):
+                items_container.controls.remove(row)
+                items_data.remove(row_data)
+                self.page.update()
+
+            remove_btn.on_click = remove_row
+            self.page.update()
+
+        sym = currency_symbol()
+        for p in prefill:
+            add_item_row(p.get("id"), p.get("name"), p.get("qty", 1))
+
+        def add_new_row(e):
+            add_item_row()
+
+        add_row_btn = ft.Button("+ Add Item", on_click=add_new_row, icon=ft.Icons.ADD)
+
+        def save_po(e):
+            if not supplier_dd.value:
+                self.snack("Supplier is required", ft.Colors.RED_700)
+                return
+            if not items_data:
+                self.snack("At least one item required", ft.Colors.RED_700)
+                return
+
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO purchase_orders (supplier_id, expected_date, notes, created_by) VALUES (?,?,?,?)",
+                    (int(supplier_dd.value), expected_date.value or None, notes.value, self.user_id)
+                )
+                po_id = cur.lastrowid
+                total_cost = 0.0
+                for rd in items_data:
+                    item_id = int(rd["id"]) if rd["id"] else None
+                    if not item_id:
+                        # try to get from dropdown
+                        item_dd = [c for c in items_container.controls if isinstance(c, ft.Row)][items_data.index(rd)].controls[0]
+                        item_id = int(item_dd.value)
+                    qty = int(rd["qty"].value or 0)
+                    cost = float(rd["cost"].value or 0)
+                    total_cost += qty * cost
+                    cur.execute(
+                        "INSERT INTO po_items (po_id, item_id, quantity_ordered, cost_price) VALUES (?,?,?,?)",
+                        (po_id, item_id, qty, cost)
+                    )
+                cur.execute("UPDATE purchase_orders SET total_cost=? WHERE id=?", (total_cost, po_id))
+                conn.commit()
+                log_audit(self.user_id, "CREATE_PO", f"PO #{po_id} created")
+                conn.close()
+                self.close_dialog(dialog)
+                self.refresh_po_list()
+                self.snack(f"Purchase Order #{po_id} created")
+            except Exception as ex:
+                self.snack(f"Error: {ex}", ft.Colors.RED_700)
+
+        dialog = ft.AlertDialog(
+            title=ft.Text("Create Purchase Order", size=18, weight=ft.FontWeight.BOLD),
+            content=ft.Column([
+                supplier_dd,
+                expected_date,
+                notes,
+                ft.Divider(),
+                ft.Text("Items:", weight=ft.FontWeight.W_500),
+                items_container,
+                add_row_btn,
+            ], spacing=12, width=650, height=500, scroll=ft.ScrollMode.AUTO),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: self.close_dialog(dialog)),
+                ft.Button("Save PO", on_click=save_po,
+                          style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE)),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.overlay.append(dialog)
+        dialog.open = True
+        self.page.update()
+
+    def edit_po_dialog(self, e):
+        po_id = e.control.data
+        # For brevity, we can implement later; similar to open but pre-filled.
+        self.snack("Edit PO not yet implemented", ft.Colors.ORANGE_700)
+
+    def receive_po_dialog(self, e):
+        po_id = e.control.data
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT status FROM purchase_orders WHERE id=?", (po_id,))
+        status = c.fetchone()
+        if status and status[0] in ("received", "cancelled"):
+            self.snack("Cannot receive this PO", ft.Colors.RED_700)
+            conn.close()
+            return
+
+        c.execute("""
+            SELECT pi.id, i.name, pi.quantity_ordered, pi.quantity_received, pi.cost_price
+            FROM po_items pi JOIN items i ON pi.item_id = i.id
+            WHERE pi.po_id = ?
+        """, (po_id,))
+        items = c.fetchall()
+        conn.close()
+
+        receive_fields = []
+        for pi_id, name, ordered, received, cost in items:
+            remaining = ordered - received
+            if remaining <= 0:
+                continue
+            qty_field = ft.TextField(label=f"{name} (max {remaining})", value=str(remaining),
+                                     keyboard_type=ft.KeyboardType.NUMBER, width=200)
+            receive_fields.append((pi_id, qty_field, cost))
+
+        if not receive_fields:
+            self.snack("All items already received", ft.Colors.ORANGE_700)
+            return
+
+        content = ft.Column([f for _, f, _ in receive_fields], spacing=10, width=300)
+
+        def do_receive(_e):
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                cur = conn.cursor()
+                all_received = True
+                for pi_id, qty_field, cost in receive_fields:
+                    qty = int(qty_field.value or 0)
+                    if qty > 0:
+                        cur.execute("UPDATE po_items SET quantity_received = quantity_received + ? WHERE id=?", (qty, pi_id))
+                        # update item stock and cost price
+                        cur.execute("SELECT item_id FROM po_items WHERE id=?", (pi_id,))
+                        item_id = cur.fetchone()[0]
+                        cur.execute("UPDATE items SET quantity = quantity + ?, cost_price = ? WHERE id=?", (qty, cost, item_id))
+                # check if fully received
+                cur.execute("SELECT COUNT(*) FROM po_items WHERE po_id=? AND quantity_received < quantity_ordered", (po_id,))
+                remaining = cur.fetchone()[0]
+                if remaining == 0:
+                    cur.execute("UPDATE purchase_orders SET status='received' WHERE id=?", (po_id,))
+                else:
+                    cur.execute("UPDATE purchase_orders SET status='ordered' WHERE id=?", (po_id,))
+                conn.commit()
+                log_audit(self.user_id, "RECEIVE_PO", f"Received items for PO #{po_id}")
+                conn.close()
+                self.close_dialog(dialog)
+                self.refresh_po_list()
+                self.snack("Items received successfully")
+            except Exception as ex:
+                self.snack(f"Error: {ex}", ft.Colors.RED_700)
+
+        dialog = ft.AlertDialog(
+            title=ft.Text(f"Receive PO #{po_id}"),
+            content=content,
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: self.close_dialog(dialog)),
+                ft.Button("Confirm Receive", on_click=do_receive,
+                          style=ft.ButtonStyle(bgcolor=ft.Colors.GREEN_700, color=ft.Colors.WHITE)),
+            ],
+        )
+        self.page.overlay.append(dialog)
+        dialog.open = True
+        self.page.update()
+
+
     def suppliers_view(self):
         if self.role != "admin":
             return ft.Column([ft.Text("Access denied", size=20, color=ft.Colors.RED_700)])
@@ -1467,8 +2008,6 @@ class StationeryApp(ft.Container):
         self.page.overlay.append(dialog)
         dialog.open = True
         self.page.update()
-
-
 
     def customers_view(self):
         if self.role != "admin":
@@ -1631,8 +2170,6 @@ class StationeryApp(ft.Container):
         self.page.overlay.append(dialog)
         dialog.open = True
         self.page.update()
-
-
 
     def users_view(self):
         if self.role != "admin":
@@ -1814,8 +2351,7 @@ class StationeryApp(ft.Container):
         dialog.open = True
         self.page.update()
 
-
-
+    # ================================================================ SETTINGS (admin only) - unchanged
     def settings_view(self):
         if self.role != "admin":
             return ft.Column([ft.Text("Access denied", size=20, color=ft.Colors.RED_700)])
@@ -1990,14 +2526,32 @@ class StationeryApp(ft.Container):
     def logout(self, e):
         log_audit(self.user_id, "LOGOUT", f"User {self.username} logged out")
         self.page.clean()
-        self.page.add(LoginPage(lambda uid, uname, role: (
-            self.page.clean(),
-            self.page.add(StationeryApp(uid, uname, role)),
-            self.page.update(),
-        )))
+        title_bar = CustomTitleBar(self.page, get_setting("store_name", "Uptown Stationery"))
+        self.page.add(
+            ft.Column([
+                title_bar,
+                ft.Container(
+                    content=LoginPage(lambda uid, uname, role: (
+                        self.page.clean(),
+                        self.page.add(
+                            ft.Column([
+                                CustomTitleBar(self.page, get_setting("store_name", "Uptown Stationery")),
+                                ft.Container(
+                                    content=StationeryApp(uid, uname, role),
+                                    expand=True,
+                                )
+                            ], spacing=0, expand=True)
+                        ),
+                        self.page.update(),
+                    )),
+                    expand=True,
+                )
+            ], spacing=0, expand=True)
+        )
         self.page.update()
 
 
+# ====================== ENTRY POINT ======================
 def main(page: ft.Page):
     page.title = f"{get_setting('store_name', 'Uptown Stationery')} — Manager"
     page.theme_mode = (
@@ -2006,36 +2560,48 @@ def main(page: ft.Page):
     page.padding = 0
     page.spacing = 0
 
-    # Fixed size
-    WIDTH, HEIGHT = 1300, 840
-
-    page.window_width = WIDTH
-    page.window_height = HEIGHT
-    page.window_min_width = WIDTH
-    page.window_max_width = WIDTH
-    page.window_min_height = HEIGHT
-    page.window_max_height = HEIGHT
-
-    # Try to disable resizing (may be ignored)
-    try:
-        page.window_resizable = False
-    except AttributeError:
-        try:
-            page.resizable = False
-        except AttributeError:
-            pass
+    page.window_frameless = True
+    page.window_width = 1300
+    page.window_height = 840
+    page.window_left = 100
+    page.window_top = 50
+    page.window_min_width = 1300
+    page.window_max_width = 1300
+    page.window_min_height = 840
+    page.window_max_height = 840
 
     page.update()
 
-    page.add(
-        LoginPage(
-            lambda uid, uname, role: (
-                page.clean(),
-                page.add(StationeryApp(uid, uname, role)),
-                page.update(),
-            )
+    title_bar = CustomTitleBar(page, get_setting("store_name", "Uptown Stationery"))
+
+    def show_login():
+        page.clean()
+        page.add(
+            ft.Column([
+                title_bar,
+                ft.Container(
+                    content=LoginPage(
+                        lambda uid, uname, role: (
+                            page.clean(),
+                            page.add(
+                                ft.Column([
+                                    CustomTitleBar(page, get_setting("store_name", "Uptown Stationery")),
+                                    ft.Container(
+                                        content=StationeryApp(uid, uname, role),
+                                        expand=True,
+                                    )
+                                ], spacing=0, expand=True)
+                            ),
+                            page.update(),
+                        )
+                    ),
+                    expand=True,
+                )
+            ], spacing=0, expand=True)
         )
-    )
-    page.update()
+        page.update()
+
+    show_login()
+
 
 ft.run(main)
