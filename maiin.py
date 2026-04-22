@@ -11,7 +11,6 @@ DB_FILE = "stationery.db"
 BACKUP_DIR = "backups"
 
 
-# ====================== DATABASE SETUP ======================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -122,7 +121,6 @@ def init_db():
 init_db()
 
 
-# ====================== HELPERS ======================
 def hash_password(pwd: str) -> str:
     return hashlib.sha256(pwd.encode()).hexdigest()
 
@@ -246,7 +244,6 @@ class LoginPage(ft.Container):
             self.update()
 
 
-# ====================== MAIN APP ======================
 class StationeryApp(ft.Container):
     def __init__(self, user_id: int, username: str, role: str):
         super().__init__(expand=True)
